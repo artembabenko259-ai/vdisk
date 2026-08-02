@@ -1,0 +1,4 @@
+*.obj
+*.exp
+vdisk_state.txt
+test_*
