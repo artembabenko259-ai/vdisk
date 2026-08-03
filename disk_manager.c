@@ -1,6 +1,7 @@
 #include "disk_manager.h"
 #include "vram_allocator.h"
 #include "vdisk_util.h"
+#include "linux_shell.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -366,6 +367,34 @@ int disk_mgr_save_config(void) {
     fclose(f);
     printf("[vdisk] Saved %d disk(s) to %s\n", count, config_file_path());
     return count;
+}
+
+int disk_mgr_linux(char drive_letter) {
+    load_state();
+
+    if (drive_letter) {
+        drive_letter = (char)toupper((unsigned char)drive_letter);
+        int idx = drive_letter - 'A';
+        if (idx < 0 || idx >= MAX_DISKS || !g_mgr.entries[idx].is_active) {
+            printf("[vdisk] No vdisk on %c:. Create one first, e.g. 'vdisk create ram 1G %c:'.\n",
+                   drive_letter, drive_letter);
+            return 0;
+        }
+    } else {
+        // Prefer an existing vdisk; otherwise spin up a default RAM disk.
+        drive_letter = 0;
+        for (int i = 0; i < MAX_DISKS; i++) {
+            if (g_mgr.entries[i].is_active) { drive_letter = g_mgr.entries[i].drive_letter; break; }
+        }
+        if (!drive_letter) {
+            drive_letter = find_free_drive_letter();
+            printf("[vdisk] No active vdisk -- creating a 1024 MB RAM disk on %c: for the session...\n",
+                   drive_letter);
+            if (!disk_mgr_create(0, (size_t)1024 * 1024 * 1024, drive_letter, "NTFS")) return 0;
+        }
+    }
+
+    return run_linux_shell(drive_letter);
 }
 
 void disk_mgr_show_config(void) {

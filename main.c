@@ -57,6 +57,7 @@ static void print_help(void) {
     printf("  vdisk mount                                   Mount every disk in config\n");
     printf("  vdisk config                                  Show the config file\n");
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
+    printf("  vdisk linux [DRIVE]                           Open a Linux (BusyBox) shell on a disk\n");
     printf("  vdisk help                                    Display this help menu\n\n");
     printf("EXAMPLES:\n");
     printf("  vdisk create ram 512M R:            512 MB RAM disk on R:\n");
@@ -130,6 +131,11 @@ int main(int argc, char *argv[]) {
     if (_stricmp(action, "config") == 0) {
         disk_mgr_show_config();
         return 0;
+    }
+
+    if (_stricmp(action, "linux") == 0 || _stricmp(action, "sh") == 0 || _stricmp(action, "shell") == 0) {
+        char drive = (argc >= 3) ? argv[2][0] : 0;
+        return disk_mgr_linux(drive) ? 0 : 1;
     }
 
     if (_stricmp(action, "autostart") == 0) {

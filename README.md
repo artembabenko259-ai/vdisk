@@ -103,6 +103,28 @@ uses the per-user `Run` registry key (no admin required).
 
 ---
 
+## Linux shell on a disk
+
+```cmd
+:: Open a bare Unix (BusyBox) shell whose root "/" is a vdisk
+vdisk linux R:      :: use disk R:
+vdisk linux         :: use the first active disk, or auto-create a RAM disk
+```
+
+`vdisk linux` drops you into an interactive [BusyBox](https://frippery.org/busybox/)
+`sh` (ash) shell — `ls`, `vi`, `grep`, `wget`, `tar`, `awk`, and ~175 other
+applets — rooted on the RAM/VRAM disk (`/` maps to the drive). BusyBox is
+downloaded once to `%LOCALAPPDATA%\vdisk` and copied onto the disk, so the whole
+environment lives on the vdisk and vanishes when the disk is removed. No admin
+required.
+
+> This is a BusyBox userland (Unix-like tools), **not** a real Linux kernel — no
+> `apt`/`apk`, and Linux ELF binaries won't run. For a full Linux distribution,
+> enable WSL2 (`wsl --install`, needs admin + reboot); your vdisk is then visible
+> inside Linux at `/mnt/<letter>`.
+
+---
+
 ## How it works
 
 Each disk is hosted by a detached worker process (`vdisk --fs-worker …`) that

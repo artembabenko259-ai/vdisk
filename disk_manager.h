@@ -37,6 +37,10 @@ int  disk_mgr_mount_config(void);   // create every disk listed in the config
 int  disk_mgr_save_config(void);    // write the currently-active disks to config
 void disk_mgr_show_config(void);    // print the config path and its contents
 
+// Opens a BusyBox Unix shell rooted on a vdisk. Uses the given drive (must be an
+// active vdisk), else the first active disk, else auto-creates a RAM disk.
+int  disk_mgr_linux(char drive_letter);
+
 size_t parse_size_string(const char *str);
 char   find_free_drive_letter(void);
 
