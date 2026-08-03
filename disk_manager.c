@@ -2,6 +2,7 @@
 #include "vram_allocator.h"
 #include "vdisk_util.h"
 #include "linux_shell.h"
+#include "block_disk.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,6 +235,13 @@ int disk_mgr_remove(char drive_letter) {
         return 0;
     }
 
+    if (block_disk_is_backing(drive_letter)) {
+        printf("[vdisk] Disk %c: currently backs an attached physical disk.\n", drive_letter);
+        printf("[vdisk] Detach it first: 'vdisk disk remove %c' (needs admin), then remove %c:.\n",
+               drive_letter, drive_letter);
+        return 0;
+    }
+
     printf("[vdisk] Removing disk %c: ...\n", drive_letter);
     kill_worker(g_mgr.entries[idx].pid);
 
@@ -245,9 +253,15 @@ int disk_mgr_remove(char drive_letter) {
 }
 
 int disk_mgr_clear(void) {
-    int count = 0;
+    int count = 0, skipped = 0;
     for (int i = 0; i < MAX_DISKS; i++) {
         if (g_mgr.entries[i].is_active) {
+            if (block_disk_is_backing(g_mgr.entries[i].drive_letter)) {
+                printf("[vdisk] Skipping %c: (backs a physical disk; run 'vdisk disk remove %c' first).\n",
+                       g_mgr.entries[i].drive_letter, g_mgr.entries[i].drive_letter);
+                skipped++;
+                continue;
+            }
             printf("[vdisk] Removing disk %c: (PID %lu) ...\n",
                    g_mgr.entries[i].drive_letter, g_mgr.entries[i].pid);
             kill_worker(g_mgr.entries[i].pid);
@@ -256,6 +270,7 @@ int disk_mgr_clear(void) {
         }
     }
     save_state();
+    (void)skipped;
 
     if (count == 0) printf("[vdisk] No active disks to clear.\n");
     else            printf("[vdisk] Cleared %d disk(s).\n", count);

@@ -17,7 +17,8 @@ so **no Administrator privileges are required** to mount or unmount them.
 - **No Admin Required**: WinFsp mounts drive letters in user mode — no UAC prompt.
 - **Persistent While Mounted**: Each disk is served by a lightweight background worker process that lives until the disk is removed.
 - **Portable**: Locates WinFsp via the registry and stores its state in `%LOCALAPPDATA%\vdisk`; runs from any folder.
-- **Comprehensive CLI**: `create`, `remove`, `clear`, `list`, `status`, and `help`.
+- **Real Physical Disks**: `vdisk disk` attaches a RAM/VRAM-backed VHD via the native virtdisk API as a genuine `\\.\PhysicalDrive` — partitionable, testable, disposable — for safely exercising destructive disk tools.
+- **Comprehensive CLI**: `create`, `disk`, `remove`, `clear`, `list`, `status`, `mount`, `autostart`, `linux`, and `help`.
 
 ---
 
@@ -100,6 +101,46 @@ vdisk config
 The config lives at `%LOCALAPPDATA%\vdisk\vdisk.conf`, one disk per line
 (`<ram|vram> <size> <letter> [fsname]`), and can be edited directly. Autostart
 uses the per-user `Run` registry key (no admin required).
+
+---
+
+## Real physical disk from RAM/VRAM (for testing disk tools)
+
+A normal `vdisk` disk is a *filesystem* (drive letter) — great for file-level
+work, but low-level disk utilities (partition managers, sector editors,
+`diskpart clean`, disk testers) want a real **physical disk** (`\\.\PhysicalDriveN`,
+visible in Disk Management). `vdisk disk` provides exactly that, backed by
+RAM/VRAM, so you can throw destructive disk tools at a disposable disk without
+risking real data.
+
+```cmd
+:: 1. Create a RAM (or VRAM) disk to hold the backing image
+vdisk create ram 1G M:
+
+:: 2. Attach a REAL raw physical disk backed by it (needs admin -> UAC)
+vdisk disk M: 512M
+
+::    -> a new raw disk appears in Disk Management / 'diskpart list disk'.
+::    Partition it, format it, run your (dangerous) disk tools on it.
+
+:: 3. When done: detach, then remove the backing RAM disk
+vdisk disk remove M:
+vdisk remove M:
+
+:: list attached physical block disks
+vdisk disk list
+```
+
+It works by creating a fixed VHD on the vdisk and attaching it with the native
+Windows **virtdisk API** (`CreateVirtualDisk`/`AttachVirtualDisk`) — no
+third-party driver. The disk is attached **raw** (unformatted) on purpose, so
+you exercise partitioning/formatting yourself. `vdisk remove` / `vdisk clear`
+refuse to drop a disk that still backs an attached physical disk, so you can't
+orphan it by accident.
+
+> Requires Administrator (attaching physical disks is a privileged operation);
+> `vdisk disk` self-elevates. Detaching uses `DetachVirtualDisk`, so removal is
+> clean — no leftover phantom disks.
 
 ---
 

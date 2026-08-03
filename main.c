@@ -1,10 +1,12 @@
 #include <windows.h>
 #include <winfsp/winfsp.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "disk_manager.h"
 #include "fs_memfs.h"
+#include "block_disk.h"
 
 #define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
@@ -41,6 +43,47 @@ static int autostart_status(void) {
     return on;
 }
 
+static BOOL is_user_admin(void) {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin;
+}
+
+// Relaunches the current command elevated (for 'vdisk disk', which drives
+// diskpart). Returns 1 if the elevated process was started.
+static int relaunch_as_admin(int argc, char *argv[]) {
+    char exe[MAX_PATH];
+    GetModuleFileNameA(NULL, exe, sizeof(exe));
+
+    char args[2048] = "";
+    for (int i = 1; i < argc; i++) {
+        strcat_s(args, sizeof(args), "\"");
+        strcat_s(args, sizeof(args), argv[i]);
+        strcat_s(args, sizeof(args), "\" ");
+    }
+
+    SHELLEXECUTEINFOA sei = { sizeof(sei) };
+    sei.lpVerb = "runas";
+    sei.lpFile = exe;
+    sei.lpParameters = args;
+    sei.nShow = SW_NORMAL;
+
+    printf("[vdisk] Administrator rights required -- requesting elevation...\n");
+    if (!ShellExecuteExA(&sei)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) printf("[vdisk] Elevation was cancelled.\n");
+        else printf("[vdisk] Failed to elevate (error %lu).\n", err);
+        return 0;
+    }
+    return 1;
+}
+
 static void print_help(void) {
     printf("\n");
     printf("=====================================================================\n");
@@ -58,6 +101,9 @@ static void print_help(void) {
     printf("  vdisk config                                  Show the config file\n");
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
     printf("  vdisk linux [DRIVE]                           Open a Linux (BusyBox) shell on a disk\n");
+    printf("  vdisk disk <DRIVE> <SIZE> [--format]          Expose a REAL physical disk backed by a vdisk\n");
+    printf("  vdisk disk remove <DRIVE>                     Detach that physical disk\n");
+    printf("  vdisk disk list                               List physical block disks\n");
     printf("  vdisk help                                    Display this help menu\n\n");
     printf("EXAMPLES:\n");
     printf("  vdisk create ram 512M R:            512 MB RAM disk on R:\n");
@@ -136,6 +182,40 @@ int main(int argc, char *argv[]) {
     if (_stricmp(action, "linux") == 0 || _stricmp(action, "sh") == 0 || _stricmp(action, "shell") == 0) {
         char drive = (argc >= 3) ? argv[2][0] : 0;
         return disk_mgr_linux(drive) ? 0 : 1;
+    }
+
+    if (_stricmp(action, "disk") == 0) {
+        // 'list' is read-only (no admin needed).
+        if (argc >= 3 && _stricmp(argv[2], "list") == 0) {
+            block_disk_list();
+            return 0;
+        }
+        if (argc < 3) {
+            printf("Usage:\n");
+            printf("  vdisk disk <DRIVE> <SIZE> [--format]   attach a real physical disk backed by that vdisk\n");
+            printf("  vdisk disk remove <DRIVE>              detach it\n");
+            printf("  vdisk disk list                        list block disks\n");
+            return 1;
+        }
+        // Everything else drives diskpart -> needs Administrator.
+        if (!is_user_admin()) {
+            return relaunch_as_admin(argc, argv) ? 0 : 1;
+        }
+        if (_stricmp(argv[2], "remove") == 0 || _stricmp(argv[2], "detach") == 0) {
+            if (argc < 4) { printf("Usage: vdisk disk remove <DRIVE>\n"); return 1; }
+            return block_disk_detach(argv[3][0]) ? 0 : 1;
+        }
+        // attach: vdisk disk <DRIVE> <SIZE> [--format]
+        if (argc < 4) { printf("Usage: vdisk disk <DRIVE> <SIZE> [--format]\n"); return 1; }
+        char L = argv[2][0];
+        size_t bytes = parse_size_string(argv[3]);
+        if (bytes == 0) { printf("Error: invalid size '%s'.\n", argv[3]); return 1; }
+        unsigned long long mb = (unsigned long long)(bytes / (1024 * 1024));
+        if (mb < 3) { printf("Error: minimum block-disk size is 3 MB.\n"); return 1; }
+        int fmt = 0;
+        for (int i = 4; i < argc; i++)
+            if (_stricmp(argv[i], "--format") == 0 || _stricmp(argv[i], "-f") == 0) fmt = 1;
+        return block_disk_attach(L, mb, fmt) ? 0 : 1;
     }
 
     if (_stricmp(action, "autostart") == 0) {
