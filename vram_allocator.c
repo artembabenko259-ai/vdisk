@@ -15,6 +15,8 @@ typedef int (CUDAAPI *PFN_cuMemFree)(size_t dptr);
 typedef int (CUDAAPI *PFN_cuMemcpyHtoD)(size_t dstDevice, const void *srcHost, size_t ByteCount);
 typedef int (CUDAAPI *PFN_cuMemcpyDtoH)(void *dstHost, size_t srcDevice, size_t ByteCount);
 typedef int (CUDAAPI *PFN_cuMemGetInfo)(size_t *free_bytes, size_t *total_bytes);
+typedef int (CUDAAPI *PFN_cuCtxSetCurrent)(void *pctx);
+typedef int (CUDAAPI *PFN_cuDevicePrimaryCtxRetain)(void **pctx, int dev);
 
 static HMODULE g_hCuda = NULL;
 static PFN_cuInit p_cuInit = NULL;
@@ -27,9 +29,18 @@ static PFN_cuMemFree p_cuMemFree = NULL;
 static PFN_cuMemcpyHtoD p_cuMemcpyHtoD = NULL;
 static PFN_cuMemcpyDtoH p_cuMemcpyDtoH = NULL;
 static PFN_cuMemGetInfo p_cuMemGetInfo = NULL;
+static PFN_cuCtxSetCurrent p_cuCtxSetCurrent = NULL;
+static PFN_cuDevicePrimaryCtxRetain p_cuDevicePrimaryCtxRetain = NULL;
 
 static void *g_cuContext = NULL;
 static int g_initialized = 0;
+
+// WinFsp dispatches filesystem operations on a thread pool. A CUDA context must
+// be made current on the calling thread before any memory operation; the
+// primary context (retained in vram_init) is safe to bind on multiple threads.
+static void vram_bind_ctx(void) {
+    if (g_cuContext && p_cuCtxSetCurrent) p_cuCtxSetCurrent(g_cuContext);
+}
 
 static int load_cuda_dll() {
     if (g_hCuda) return 1;
@@ -40,8 +51,9 @@ static int load_cuda_dll() {
     p_cuInit = (PFN_cuInit)GetProcAddress(g_hCuda, "cuInit");
     p_cuDeviceGet = (PFN_cuDeviceGet)GetProcAddress(g_hCuda, "cuDeviceGet");
     p_cuDeviceGetName = (PFN_cuDeviceGetName)GetProcAddress(g_hCuda, "cuDeviceGetName");
-    p_cuDeviceTotalMem = (PFN_cuDeviceTotalMem)GetProcAddress(g_hCuda, "cuDeviceTotalMem");
-    
+    p_cuDeviceTotalMem = (PFN_cuDeviceTotalMem)GetProcAddress(g_hCuda, "cuDeviceTotalMem_v2");
+    if (!p_cuDeviceTotalMem) p_cuDeviceTotalMem = (PFN_cuDeviceTotalMem)GetProcAddress(g_hCuda, "cuDeviceTotalMem");
+
     p_cuCtxCreate = (PFN_cuCtxCreate)GetProcAddress(g_hCuda, "cuCtxCreate_v2");
     if (!p_cuCtxCreate) p_cuCtxCreate = (PFN_cuCtxCreate)GetProcAddress(g_hCuda, "cuCtxCreate");
     
@@ -59,6 +71,9 @@ static int load_cuda_dll() {
 
     p_cuMemGetInfo = (PFN_cuMemGetInfo)GetProcAddress(g_hCuda, "cuMemGetInfo_v2");
     if (!p_cuMemGetInfo) p_cuMemGetInfo = (PFN_cuMemGetInfo)GetProcAddress(g_hCuda, "cuMemGetInfo");
+
+    p_cuCtxSetCurrent = (PFN_cuCtxSetCurrent)GetProcAddress(g_hCuda, "cuCtxSetCurrent");
+    p_cuDevicePrimaryCtxRetain = (PFN_cuDevicePrimaryCtxRetain)GetProcAddress(g_hCuda, "cuDevicePrimaryCtxRetain");
 
     if (!p_cuInit || !p_cuDeviceGet || !p_cuCtxCreate || !p_cuMemAlloc || !p_cuMemFree || !p_cuMemcpyHtoD || !p_cuMemcpyDtoH) {
         FreeLibrary(g_hCuda);
@@ -86,11 +101,17 @@ int vram_init(vram_info_t *info) {
     }
 
     if (!g_cuContext) {
-        if (p_cuCtxCreate(&g_cuContext, 0, dev) != 0) {
+        int cerr = 1;
+        if (p_cuDevicePrimaryCtxRetain)
+            cerr = p_cuDevicePrimaryCtxRetain(&g_cuContext, dev);
+        if (cerr != 0 || !g_cuContext)
+            cerr = p_cuCtxCreate(&g_cuContext, 0, dev);
+        if (cerr != 0) {
             if (info) info->is_cuda_available = 0;
             return 0;
         }
     }
+    vram_bind_ctx();
 
     g_initialized = 1;
 
@@ -117,6 +138,7 @@ size_t vram_allocate(size_t bytes) {
         if (!vram_init(NULL)) return 0;
     }
 
+    vram_bind_ctx();
     size_t dptr = 0;
     int res = p_cuMemAlloc(&dptr, bytes);
     if (res != 0) {
@@ -128,17 +150,20 @@ size_t vram_allocate(size_t bytes) {
 
 void vram_free(size_t dptr) {
     if (!dptr || !p_cuMemFree) return;
+    vram_bind_ctx();
     p_cuMemFree(dptr);
 }
 
 int vram_read(size_t dptr, size_t offset, void *dst_host, size_t length) {
     if (!dptr || !dst_host || !p_cuMemcpyDtoH) return 0;
+    vram_bind_ctx();
     int res = p_cuMemcpyDtoH(dst_host, dptr + offset, length);
     return (res == 0);
 }
 
 int vram_write(size_t dptr, size_t offset, const void *src_host, size_t length) {
     if (!dptr || !src_host || !p_cuMemcpyHtoD) return 0;
+    vram_bind_ctx();
     int res = p_cuMemcpyHtoD(dptr + offset, src_host, length);
     return (res == 0);
 }

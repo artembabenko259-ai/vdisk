@@ -1,33 +1,43 @@
 # vdisk - Temporary RAM & VRAM Disk CLI Utility
 
-A high-performance command-line utility written in **C** for creating, managing, and removing temporary **RAM disks** and **GPU VRAM disks** on Windows.
+A command-line utility written in **C** for creating, managing, and removing
+temporary **RAM disks** and **GPU VRAM disks** on Windows.
 
-Disks created by `vdisk` appear as real Windows block storage devices (`R:\`, `V:\`, etc.) and are fully compatible with File Explorer, CMD, PowerShell, and disk benchmarking/testing tools (CrystalDiskMark, HD Tune, DiskPart, Victoria, etc.).
+Disks created by `vdisk` appear as real Windows drive letters (`R:\`, `V:\`,
+etc.) and work with File Explorer, CMD, PowerShell, and ordinary applications.
+They are backed by a user-mode filesystem built on **[WinFsp](https://winfsp.dev)**,
+so **no Administrator privileges are required** to mount or unmount them.
 
 ---
 
 ## Features
 
-- **RAM Disks**: Ultra-fast virtual disks created directly in System RAM.
-- **GPU VRAM Disks**: Hardware-accelerated virtual disks allocated directly in VRAM on NVIDIA GPUs via **CUDA API** (`nvcuda.dll`).
-- **Real Windows Block Drives**: Exposed as native SCSI/Block storage devices (`\\.\PhysicalDriveX` / Drive Letters) formatted with NTFS/FAT32.
-- **Mandatory Administrator Privilege Enforcement**: Automatically detects privileges and prompts for UAC elevation if needed.
-- **Comprehensive CLI**: Includes `create`, `remove`, `list`, `status`, and `help` commands.
+- **RAM Disks**: File contents are stored directly in system RAM.
+- **GPU VRAM Disks**: File contents are stored in NVIDIA GPU VRAM via the **CUDA API** (`nvcuda.dll`), verified with bit-exact read-back.
+- **No Admin Required**: WinFsp mounts drive letters in user mode — no UAC prompt.
+- **Persistent While Mounted**: Each disk is served by a lightweight background worker process that lives until the disk is removed.
+- **Portable**: Locates WinFsp via the registry and stores its state in `%LOCALAPPDATA%\vdisk`; runs from any folder.
+- **Comprehensive CLI**: `create`, `remove`, `clear`, `list`, `status`, and `help`.
 
 ---
 
-## Installation & PATH
+## Prerequisites
 
-Add the directory containing `vdisk.exe` to your Windows `PATH` environment variable:
-```powershell
-[Environment]::SetEnvironmentVariable("PATH", $env:PATH + ";C:\path\to\vdisk", "User")
-```
+- **[WinFsp](https://winfsp.dev)** must be installed (runtime is required to run;
+  the Developer/SDK feature is required to build). Install with:
+  ```powershell
+  winget install WinFsp.WinFsp
+  ```
+  To build from source you also need the SDK headers/libs — reinstall selecting
+  all features if `C:\Program Files (x86)\WinFsp\inc` is missing:
+  ```powershell
+  msiexec /i winfsp.msi ADDLOCAL=ALL
+  ```
+- An **NVIDIA GPU with drivers** (only needed for `vram` disks).
 
 ---
 
 ## Usage
-
-> **Note:** Administrative privileges are required by Windows to mount/unmount block storage devices.
 
 ```cmd
 :: Show help & commands
@@ -50,24 +60,53 @@ vdisk list
 
 :: Remove/unmount virtual disk R:
 vdisk remove R:
+
+:: Remove ALL vdisk-managed disks at once
+vdisk clear
 ```
+
+Sizes accept `K`, `M`, `G` suffixes (e.g. `512M`, `1G`, `2048M`). If no drive
+letter is given, the next free one (from `Z:` down) is used.
+
+---
+
+## How it works
+
+Each disk is hosted by a detached worker process (`vdisk --fs-worker …`) that
+runs an in-memory WinFsp/FUSE filesystem for the lifetime of the disk:
+
+- `create` launches the worker, waits for the drive letter to appear, and records the worker's PID (shown in `vdisk list`, stored in `%LOCALAPPDATA%\vdisk\vdisk_state.txt`).
+- `remove` / `clear` terminate the worker; WinFsp unmounts the drive automatically.
+
+For `vram` disks, file data lives in GPU memory (allocated with `cuMemAlloc`);
+reads and writes stream through the CUDA driver API. The CUDA primary context is
+bound per worker thread so WinFsp's thread pool can access VRAM safely.
 
 ---
 
 ## Building from Source
 
 ### Prerequisites
-- Visual Studio / MSVC C Compiler (`cl.exe`)
+- Visual Studio / MSVC C compiler (`cl.exe`)
+- WinFsp with the SDK (see above)
 - Windows 10/11 64-bit
 
-### Build Command
-Run `build.bat` or compile with `cl.exe`:
+### Build
+Run `build.bat` (auto-detects MSVC via `vswhere` and WinFsp via the registry), or
+compile manually:
 ```cmd
-cl.exe /O2 /W3 main.c vram_allocator.c vram_proxy.c imdisk_driver.c vhd_driver.c disk_manager.c advapi32.lib user32.lib shell32.lib virtdisk.lib /Fe:vdisk.exe
+cl.exe /O2 /W3 /I "C:\Program Files (x86)\WinFsp\inc" ^
+    main.c disk_manager.c vram_allocator.c vdisk_util.c fs_memfs.c ^
+    "C:\Program Files (x86)\WinFsp\lib\winfsp-x64.lib" ^
+    /Fe:vdisk.exe ^
+    /link /DELAYLOAD:winfsp-x64.dll delayimp.lib advapi32.lib
 ```
 
 ---
 
 ## License
 
-MIT License.
+MIT License. See `LICENSE.md`.
+
+WinFsp is a separate dependency installed by the user and is licensed under its
+own terms (GPLv3 with a commercial option) — it is not redistributed here.
