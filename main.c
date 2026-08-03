@@ -101,8 +101,10 @@ static void print_help(void) {
     printf("  vdisk config                                  Show the config file\n");
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
     printf("  vdisk linux [DRIVE]                           Open a Linux (BusyBox) shell on a disk\n");
-    printf("  vdisk disk <DRIVE> <SIZE> [--format]          Expose a REAL physical disk backed by a vdisk\n");
-    printf("  vdisk disk remove <DRIVE>                     Detach that physical disk\n");
+    printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
+    printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
+    printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
+    printf("  vdisk disk remove <DRIVE>                     Detach it (and its backing if RAM/VRAM one-step)\n");
     printf("  vdisk disk list                               List physical block disks\n");
     printf("  vdisk help                                    Display this help menu\n\n");
     printf("EXAMPLES:\n");
@@ -205,7 +207,17 @@ int main(int argc, char *argv[]) {
             if (argc < 4) { printf("Usage: vdisk disk remove <DRIVE>\n"); return 1; }
             return block_disk_detach(argv[3][0]) ? 0 : 1;
         }
-        // attach: vdisk disk <DRIVE> <SIZE> [--format]
+        // one-step: vdisk disk ram|vram <SIZE> [DRIVE]  (creates backing + attaches)
+        if (_stricmp(argv[2], "ram") == 0 || _stricmp(argv[2], "vram") == 0) {
+            if (argc < 4) { printf("Usage: vdisk disk %s <SIZE> [DRIVE]\n", argv[2]); return 1; }
+            int use_vram = (_stricmp(argv[2], "vram") == 0);
+            size_t bytes = parse_size_string(argv[3]);
+            if (bytes == 0) { printf("Error: invalid size '%s'.\n", argv[3]); return 1; }
+            unsigned long long mb = (unsigned long long)(bytes / (1024 * 1024));
+            char letter = (argc >= 5) ? argv[4][0] : 0;
+            return block_disk_create_auto(use_vram, mb, letter) ? 0 : 1;
+        }
+        // explicit: vdisk disk <DRIVE> <SIZE> [--format]  (attach onto existing vdisk)
         if (argc < 4) { printf("Usage: vdisk disk <DRIVE> <SIZE> [--format]\n"); return 1; }
         char L = argv[2][0];
         size_t bytes = parse_size_string(argv[3]);

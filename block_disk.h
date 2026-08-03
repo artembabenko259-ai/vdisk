@@ -16,6 +16,11 @@
 // Returns 1 on success.
 int block_disk_attach(char backing_letter, unsigned long long size_mb, int do_format);
 
+// Convenience: creates the backing RAM/VRAM vdisk AND attaches the physical disk
+// in one step (use_vram selects the backend). 'backing_letter' may be 0 to pick
+// a free letter. 'vdisk disk remove <letter>' then tears down both.
+int block_disk_create_auto(int use_vram, unsigned long long size_mb, char backing_letter);
+
 // Detaches the block disk backed by 'backing_letter' (its VHD is on that vdisk).
 // Safe to call even if nothing is attached. Returns 1 on success.
 int block_disk_detach(char backing_letter);
