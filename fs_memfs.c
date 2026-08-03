@@ -467,7 +467,7 @@ static int op_fsync(const char *path, int d, struct fuse_file_info *fi) { (void)
 
 // --- entry point ----------------------------------------------------------
 
-int fs_run(int use_vram, unsigned long long size_mb, char drive_letter) {
+int fs_run(int use_vram, unsigned long long size_mb, char drive_letter, const char *fs_name) {
     g_use_vram = use_vram;
     g_capacity = size_mb * 1024ULL * 1024ULL;
     g_used = 0;
@@ -511,11 +511,14 @@ int fs_run(int use_vram, unsigned long long size_mb, char drive_letter) {
     char mountpoint[8];
     snprintf(mountpoint, sizeof(mountpoint), "%c:", drive_letter);
 
+    char opts[128];
+    snprintf(opts, sizeof(opts), "uid=-1,gid=-1,FileSystemName=%s",
+             (fs_name && *fs_name) ? fs_name : "NTFS");
+
     char a0[] = "vdisk";
     char a1[] = "-f";                       // foreground: block in this process
     char a2[] = "-o";
-    char a3[] = "uid=-1,gid=-1";            // map ownership to the mounting user
-    char *argv[] = { a0, a1, a2, a3, mountpoint, NULL };
+    char *argv[] = { a0, a1, a2, opts, mountpoint, NULL };
     int argc = 5;
 
     return fuse_main_real(argc, argv, &ops, sizeof(ops), NULL);

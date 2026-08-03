@@ -10,12 +10,23 @@ static disk_manager_t g_mgr;
 
 // State lives in a stable per-user location so it is consistent regardless of
 // the working directory a command is launched from.
+static const char *data_file(const char *name) {
+    static char path[MAX_PATH];
+    char dir[MAX_PATH];
+    if (get_data_dir(dir, sizeof(dir))) snprintf(path, sizeof(path), "%s\\%s", dir, name);
+    else strcpy_s(path, sizeof(path), name);
+    return path;
+}
+
 static const char *state_file_path(void) {
     static char path[MAX_PATH] = {0};
-    if (path[0]) return path;
-    char dir[MAX_PATH];
-    if (get_data_dir(dir, sizeof(dir))) snprintf(path, sizeof(path), "%s\\vdisk_state.txt", dir);
-    else strcpy_s(path, sizeof(path), "vdisk_state.txt");
+    if (!path[0]) strcpy_s(path, sizeof(path), data_file("vdisk_state.txt"));
+    return path;
+}
+
+static const char *config_file_path(void) {
+    static char path[MAX_PATH] = {0};
+    if (!path[0]) strcpy_s(path, sizeof(path), data_file("vdisk.conf"));
     return path;
 }
 
@@ -28,18 +39,21 @@ static void load_state(void) {
     while (fgets(line, sizeof(line), f)) {
         char drive;
         char type_str[16];
+        char fs_str[16] = "NTFS";
         size_t size_b;
         DWORD pid;
-        if (sscanf_s(line, "%c %15s %llu %lu",
+        if (sscanf_s(line, "%c %15s %llu %lu %15s",
                      &drive, (unsigned)1,
                      type_str, (unsigned)sizeof(type_str),
-                     (unsigned long long *)&size_b, &pid) >= 4) {
+                     (unsigned long long *)&size_b, &pid,
+                     fs_str, (unsigned)sizeof(fs_str)) >= 4) {
             int idx = toupper((unsigned char)drive) - 'A';
             if (idx >= 0 && idx < MAX_DISKS) {
                 g_mgr.entries[idx].drive_letter = (char)toupper((unsigned char)drive);
                 g_mgr.entries[idx].type = (strcmp(type_str, "VRAM") == 0) ? DISK_TYPE_VRAM : DISK_TYPE_RAM;
                 g_mgr.entries[idx].size_bytes = size_b;
                 g_mgr.entries[idx].pid = pid;
+                strcpy_s(g_mgr.entries[idx].fs_name, sizeof(g_mgr.entries[idx].fs_name), fs_str);
                 g_mgr.entries[idx].is_active = 1;
             }
         }
@@ -52,11 +66,12 @@ static void save_state(void) {
     if (!f) return;
     for (int i = 0; i < MAX_DISKS; i++) {
         if (g_mgr.entries[i].is_active) {
-            fprintf(f, "%c %s %llu %lu\n",
+            fprintf(f, "%c %s %llu %lu %s\n",
                     g_mgr.entries[i].drive_letter,
                     (g_mgr.entries[i].type == DISK_TYPE_VRAM) ? "VRAM" : "RAM",
                     (unsigned long long)g_mgr.entries[i].size_bytes,
-                    g_mgr.entries[i].pid);
+                    g_mgr.entries[i].pid,
+                    g_mgr.entries[i].fs_name[0] ? g_mgr.entries[i].fs_name : "NTFS");
         }
     }
     fclose(f);
@@ -97,13 +112,15 @@ static int drive_in_use(char letter) {
 
 // Launches the detached WinFsp worker process for one disk and waits until the
 // drive letter appears (or the worker dies / times out).
-static DWORD spawn_worker(int use_vram, unsigned long long size_mb, char drive_letter) {
+static DWORD spawn_worker(int use_vram, unsigned long long size_mb, char drive_letter,
+                          const char *fs_name) {
     char exe[MAX_PATH];
     GetModuleFileNameA(NULL, exe, sizeof(exe));
 
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "\"%s\" --fs-worker %s %llu %c",
-             exe, use_vram ? "vram" : "ram", size_mb, drive_letter);
+    snprintf(cmd, sizeof(cmd), "\"%s\" --fs-worker %s %llu %c %s",
+             exe, use_vram ? "vram" : "ram", size_mb, drive_letter,
+             (fs_name && *fs_name) ? fs_name : "NTFS");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
@@ -142,7 +159,8 @@ static void kill_worker(DWORD pid) {
     }
 }
 
-int disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter) {
+int disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter, const char *fs_name) {
+    if (!fs_name || !*fs_name) fs_name = "NTFS";
     if (!drive_letter) drive_letter = find_free_drive_letter();
     drive_letter = (char)toupper((unsigned char)drive_letter);
     if (drive_letter < 'A' || drive_letter > 'Z') {
@@ -178,10 +196,10 @@ int disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter) {
         }
     }
 
-    printf("[vdisk] Creating %s disk of %llu MB on drive %c: ...\n",
-           use_vram ? "VRAM" : "RAM", size_mb, drive_letter);
+    printf("[vdisk] Creating %s disk of %llu MB on drive %c: (%s) ...\n",
+           use_vram ? "VRAM" : "RAM", size_mb, drive_letter, fs_name);
 
-    DWORD pid = spawn_worker(use_vram, size_mb, drive_letter);
+    DWORD pid = spawn_worker(use_vram, size_mb, drive_letter, fs_name);
     if (!pid) {
         printf("[vdisk] Failed to mount %s disk on drive %c:\n",
                use_vram ? "VRAM" : "RAM", drive_letter);
@@ -193,6 +211,7 @@ int disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter) {
     g_mgr.entries[idx].type = use_vram ? DISK_TYPE_VRAM : DISK_TYPE_RAM;
     g_mgr.entries[idx].size_bytes = size_bytes;
     g_mgr.entries[idx].pid = pid;
+    strcpy_s(g_mgr.entries[idx].fs_name, sizeof(g_mgr.entries[idx].fs_name), fs_name);
     g_mgr.entries[idx].is_active = 1;
     save_state();
 
@@ -290,4 +309,72 @@ void disk_mgr_status(void) {
         printf("GPU VRAM:   CUDA Acceleration Unavailable\n");
     }
     printf("================================\n\n");
+}
+
+int disk_mgr_mount_config(void) {
+    FILE *f = fopen(config_file_path(), "r");
+    if (!f) {
+        printf("[vdisk] No config file at %s\n", config_file_path());
+        printf("[vdisk] Set up disks and run 'vdisk save', or edit the file (see 'vdisk config').\n");
+        return 0;
+    }
+
+    int count = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n' || *p == '\r') continue;
+
+        char type[16] = "", size[32] = "", letter[8] = "", fs[16] = "NTFS";
+        int n = sscanf_s(p, "%15s %31s %7s %15s",
+                         type, (unsigned)sizeof(type),
+                         size, (unsigned)sizeof(size),
+                         letter, (unsigned)sizeof(letter),
+                         fs, (unsigned)sizeof(fs));
+        if (n < 3) continue;
+
+        int use_vram = (_stricmp(type, "vram") == 0);
+        size_t bytes = parse_size_string(size);
+        if (bytes == 0) { printf("[vdisk] Skipping line with invalid size '%s'\n", size); continue; }
+        char L = (char)toupper((unsigned char)letter[0]);
+        if (disk_mgr_create(use_vram, bytes, L, fs)) count++;
+    }
+    fclose(f);
+    printf("[vdisk] Mounted %d disk(s) from config.\n", count);
+    return count;
+}
+
+int disk_mgr_save_config(void) {
+    load_state();
+    FILE *f = fopen(config_file_path(), "w");
+    if (!f) { printf("[vdisk] Failed to write config file.\n"); return 0; }
+
+    fprintf(f, "# vdisk auto-mount config -- one disk per line:\n");
+    fprintf(f, "#   <ram|vram> <size> <letter> [fsname]\n");
+    int count = 0;
+    for (int i = 0; i < MAX_DISKS; i++) {
+        if (g_mgr.entries[i].is_active) {
+            fprintf(f, "%s %lluM %c %s\n",
+                    g_mgr.entries[i].type == DISK_TYPE_VRAM ? "vram" : "ram",
+                    (unsigned long long)(g_mgr.entries[i].size_bytes / (1024 * 1024)),
+                    g_mgr.entries[i].drive_letter,
+                    g_mgr.entries[i].fs_name[0] ? g_mgr.entries[i].fs_name : "NTFS");
+            count++;
+        }
+    }
+    fclose(f);
+    printf("[vdisk] Saved %d disk(s) to %s\n", count, config_file_path());
+    return count;
+}
+
+void disk_mgr_show_config(void) {
+    printf("[vdisk] Config file: %s\n", config_file_path());
+    FILE *f = fopen(config_file_path(), "r");
+    if (!f) { printf("[vdisk] (does not exist yet -- use 'vdisk save' or create it)\n"); return; }
+    printf("--------------------------------------------------------\n");
+    char line[256];
+    while (fgets(line, sizeof(line), f)) fputs(line, stdout);
+    printf("--------------------------------------------------------\n");
+    fclose(f);
 }

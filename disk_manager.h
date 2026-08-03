@@ -16,6 +16,7 @@ typedef struct {
     disk_type_t type;
     size_t      size_bytes;
     DWORD       pid;          // PID of the WinFsp worker hosting this disk
+    char        fs_name[16];  // reported filesystem name (e.g. "NTFS")
     int         is_active;
 } disk_entry_t;
 
@@ -24,11 +25,17 @@ typedef struct {
 } disk_manager_t;
 
 void disk_mgr_init(void);
-int  disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter);
+int  disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter, const char *fs_name);
 int  disk_mgr_remove(char drive_letter);
 int  disk_mgr_clear(void);
 void disk_mgr_list(void);
 void disk_mgr_status(void);
+
+// Config-driven auto-mounting. The config file lists one disk per line:
+//   <ram|vram> <size> <letter> [fsname]      e.g.  ram 512M R NTFS
+int  disk_mgr_mount_config(void);   // create every disk listed in the config
+int  disk_mgr_save_config(void);    // write the currently-active disks to config
+void disk_mgr_show_config(void);    // print the config path and its contents
 
 size_t parse_size_string(const char *str);
 char   find_free_drive_letter(void);

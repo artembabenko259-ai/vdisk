@@ -55,6 +55,9 @@ vdisk create vram 1024M V:
 :: Create a 2 GB RAM disk on the next available drive letter
 vdisk create ram 2G
 
+:: Create a disk reported to Windows as FAT32 (default is NTFS)
+vdisk create ram 512M R: -f FAT32
+
 :: List all active mounted disks
 vdisk list
 
@@ -66,7 +69,37 @@ vdisk clear
 ```
 
 Sizes accept `K`, `M`, `G` suffixes (e.g. `512M`, `1G`, `2048M`). If no drive
-letter is given, the next free one (from `Z:` down) is used.
+letter is given, the next free one (from `Z:` down) is used. `-f <name>` sets
+the filesystem name Windows reports for the drive (default `NTFS`).
+
+---
+
+## Auto-mount at login
+
+Set up the disks you want once, remember them, and have them mounted
+automatically every time you log in — no need to run the exe by hand:
+
+```cmd
+:: 1. Create the disks you want
+vdisk create ram 1G R:
+vdisk create vram 512M V:
+
+:: 2. Remember the current set of disks
+vdisk save
+
+:: 3. Mount everything from the saved config in one shot (any time)
+vdisk mount
+
+:: 4. Have 'vdisk mount' run automatically at each login
+vdisk autostart on          ::  autostart off  /  autostart status
+
+:: Inspect / hand-edit the config
+vdisk config
+```
+
+The config lives at `%LOCALAPPDATA%\vdisk\vdisk.conf`, one disk per line
+(`<ram|vram> <size> <letter> [fsname]`), and can be edited directly. Autostart
+uses the per-user `Run` registry key (no admin required).
 
 ---
 
