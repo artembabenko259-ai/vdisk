@@ -1,3 +1,4 @@
+*.exe
 *.obj
 *.exp
 vdisk_state.txt
