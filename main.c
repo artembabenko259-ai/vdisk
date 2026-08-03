@@ -7,6 +7,7 @@
 #include "disk_manager.h"
 #include "fs_memfs.h"
 #include "block_disk.h"
+#include "qemu_linux.h"
 
 #define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
@@ -100,7 +101,8 @@ static void print_help(void) {
     printf("  vdisk mount                                   Mount every disk in config\n");
     printf("  vdisk config                                  Show the config file\n");
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
-    printf("  vdisk linux [DRIVE]                           Open a Linux (BusyBox) shell on a disk\n");
+    printf("  vdisk linux [DRIVE]                           Instant BusyBox Unix shell on a disk\n");
+    printf("  vdisk linux -s <DRIVE>                        REAL Alpine Linux in QEMU (headless console)\n");
     printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
     printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
     printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
@@ -182,6 +184,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (_stricmp(action, "linux") == 0 || _stricmp(action, "sh") == 0 || _stricmp(action, "shell") == 0) {
+        // vdisk linux -s <DRIVE>  -> real Alpine Linux in QEMU (headless console)
+        if (argc >= 3 && _stricmp(argv[2], "-s") == 0) {
+            char drive = (argc >= 4) ? argv[3][0] : 0;
+            return qemu_run_linux(drive) ? 0 : 1;
+        }
+        // vdisk linux [DRIVE]     -> instant BusyBox shell
         char drive = (argc >= 3) ? argv[2][0] : 0;
         return disk_mgr_linux(drive) ? 0 : 1;
     }

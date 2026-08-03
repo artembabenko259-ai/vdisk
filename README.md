@@ -18,6 +18,7 @@ so **no Administrator privileges are required** to mount or unmount them.
 - **Persistent While Mounted**: Each disk is served by a lightweight background worker process that lives until the disk is removed.
 - **Portable**: Locates WinFsp via the registry and stores its state in `%LOCALAPPDATA%\vdisk`; runs from any folder.
 - **Real Physical Disks**: `vdisk disk` attaches a RAM/VRAM-backed VHD via the native virtdisk API as a genuine `\\.\PhysicalDrive` — partitionable, testable, disposable — for safely exercising destructive disk tools.
+- **Real Linux VM**: `vdisk linux -s <DRIVE>` boots a real Alpine Linux kernel in QEMU, headless in your console, using the vdisk as storage (no admin, no reboot).
 - **Comprehensive CLI**: `create`, `disk`, `remove`, `clear`, `list`, `status`, `mount`, `autostart`, `linux`, and `help`.
 
 ---
@@ -160,9 +161,30 @@ environment lives on the vdisk and vanishes when the disk is removed. No admin
 required.
 
 > This is a BusyBox userland (Unix-like tools), **not** a real Linux kernel — no
-> `apt`/`apk`, and Linux ELF binaries won't run. For a full Linux distribution,
-> enable WSL2 (`wsl --install`, needs admin + reboot); your vdisk is then visible
-> inside Linux at `/mnt/<letter>`.
+> `apt`/`apk`, and Linux ELF binaries won't run. For a real kernel, use
+> `vdisk linux -s` below.
+
+### Real Linux (QEMU)
+
+```cmd
+:: mount a vdisk as usual, then boot a real Alpine Linux in it
+vdisk create ram 2G D:
+vdisk linux -s D
+```
+
+`vdisk linux -s <DRIVE>` boots a **real Alpine Linux kernel** in QEMU, headless,
+right in your Windows console (serial console, WSL2-style). Log in as `root`
+(no password); the vdisk provides a RAM/VRAM-backed data disk to the VM as
+`/dev/vda`. Type `poweroff` (or press `Ctrl-A` then `X`) to leave.
+
+- Real kernel, `apk`, ELF binaries, networking — a genuine Linux VM.
+- **No admin, no reboot** — uses QEMU software emulation (TCG).
+- Alpine (~60 MB) is downloaded once into `%LOCALAPPDATA%\vdisk`.
+- Requires QEMU: `winget install SoftwareFreedomConservancy.QEMU`.
+
+> Because it is software emulation (TCG), boot takes ~1–2 minutes and it runs
+> slowly. For near-native speed, enable "Windows Hypervisor Platform" (admin +
+> reboot) — QEMU then uses `whpx` acceleration.
 
 ---
 
