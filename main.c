@@ -8,6 +8,7 @@
 #include "fs_memfs.h"
 #include "block_disk.h"
 #include "qemu_linux.h"
+#include "save_disk.h"
 
 #define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
@@ -97,7 +98,8 @@ static void print_help(void) {
     printf("  vdisk clear                                   Remove ALL disks\n");
     printf("  vdisk list                                    List active disks\n");
     printf("  vdisk status                                  Show RAM/VRAM hardware info\n");
-    printf("  vdisk save                                    Save active disks to config\n");
+    printf("  vdisk save                                    Remember active disks for auto-mount\n");
+    printf("  vdisk save <DISK> \"<DEST>\" [ITEM ...]          Copy data OUT of a disk (persist before wipe)\n");
     printf("  vdisk mount                                   Mount every disk in config\n");
     printf("  vdisk config                                  Show the config file\n");
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
@@ -174,8 +176,30 @@ int main(int argc, char *argv[]) {
     }
 
     if (_stricmp(action, "save") == 0) {
-        disk_mgr_save_config();
-        return 0;
+        // No args  -> remember active disks for auto-mount (config).
+        // <DISK> <DEST> [ITEM ...] -> copy data OUT of a disk to a real path.
+        if (argc <= 2) {
+            disk_mgr_save_config();
+            return 0;
+        }
+        if (argc < 4) {
+            printf("Usage:\n");
+            printf("  vdisk save                              remember active disks for auto-mount\n");
+            printf("  vdisk save <DISK> \"<DEST>\" [ITEM ...]   copy data out of a disk to <DEST>\n");
+            printf("                                          (no ITEM or '.' = the whole disk)\n");
+            return 1;
+        }
+        char disk = argv[2][0];
+        const char *dest = argv[3];
+        const char *items[64];
+        int n = 0;
+        for (int i = 4; i < argc && n < 64; i++) {
+            if (i == 4 && (_stricmp(argv[i], "--path") == 0 || _stricmp(argv[i], "-path") == 0 ||
+                           _stricmp(argv[i], "--paths") == 0 || _stricmp(argv[i], "-add") == 0))
+                continue; // tolerate an optional keyword before the item list
+            items[n++] = argv[i];
+        }
+        return disk_save(disk, dest, items, n) ? 0 : 1;
     }
 
     if (_stricmp(action, "config") == 0) {

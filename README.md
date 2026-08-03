@@ -94,6 +94,24 @@ the filesystem name Windows reports for the drive (default `NTFS`).
 
 ---
 
+## Saving data off a disk (before it's wiped)
+
+RAM/VRAM disks are ephemeral — copy anything worth keeping to a real path first:
+
+```cmd
+:: copy the WHOLE disk R: to a folder
+vdisk save R "D:\keep"
+
+:: copy only specific files/folders (relative to the disk root)
+vdisk save R "D:\keep" report.txt logs data\out.bin
+```
+
+Directory structure is preserved; the destination is created if needed. No admin
+required. (Note: `vdisk save` with **no** arguments instead remembers the current
+disks for auto-mount — see below.)
+
+---
+
 ## Auto-mount at login
 
 Set up the disks you want once, remember them, and have them mounted
