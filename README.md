@@ -23,6 +23,24 @@ so **no Administrator privileges are required** to mount or unmount them.
 
 ---
 
+## Install (easy)
+
+Grab the [latest release](https://github.com/artembabenko259-ai/vdisk/releases/latest),
+unzip it anywhere, and run **`install.bat`**. It installs the dependencies via
+`winget` (WinFsp — required; QEMU — for the Linux VM) and adds `vdisk` to your
+`PATH`. Then open a new terminal and run `vdisk help`.
+
+```powershell
+# or do it by hand:
+winget install WinFsp.WinFsp                       # required
+winget install SoftwareFreedomConservancy.QEMU     # for 'vdisk linux -s'
+```
+
+Everything else `vdisk` needs (the virtdisk API, and the BusyBox / Alpine
+downloads) is built in or fetched automatically on first use.
+
+---
+
 ## Prerequisites
 
 - **[WinFsp](https://winfsp.dev)** must be installed (runtime is required to run;
