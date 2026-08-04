@@ -217,6 +217,14 @@ int disk_mgr_create(int use_vram, size_t size_bytes, char drive_letter, const ch
     g_mgr.entries[idx].is_active = 1;
     save_state();
 
+    // Give every fresh disk the same starter layout instead of a bare drive
+    // root: Data\ for your own files, VM\ for vdisk-linux's own image files.
+    char folder[16];
+    snprintf(folder, sizeof(folder), "%c:\\Data", drive_letter);
+    CreateDirectoryA(folder, NULL);
+    snprintf(folder, sizeof(folder), "%c:\\VM", drive_letter);
+    CreateDirectoryA(folder, NULL);
+
     printf("[vdisk] SUCCESS! %s disk mounted at drive %c:\\ (worker PID %lu)\n",
            use_vram ? "VRAM" : "RAM", drive_letter, pid);
     return 1;

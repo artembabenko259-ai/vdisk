@@ -306,11 +306,15 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
     }
 
     // A RAM/VRAM-backed data disk (on the vdisk) exposed to Linux as /dev/vda.
-    char img[MAX_PATH];
-    snprintf(img, sizeof(img), "%c:\\linux.img", L);
+    // Lives in VM\ (created by disk_mgr_create; CreateDirectory here too in
+    // case this disk predates that, or was made by something else).
+    char vmdir[MAX_PATH], img[MAX_PATH];
+    snprintf(vmdir, sizeof(vmdir), "%c:\\VM", L);
+    CreateDirectoryA(vmdir, NULL);
+    snprintf(img, sizeof(img), "%c:\\VM\\linux.img", L);
     int have_img = file_exists(img);
     if (!have_img) {
-        printf("[vdisk] Creating a %d MB data disk %c:\\linux.img ...\n", DATA_IMG_MB, L);
+        printf("[vdisk] Creating a %d MB data disk %c:\\VM\\linux.img ...\n", DATA_IMG_MB, L);
         HANDLE hf = CreateFileA(img, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hf != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER sz;
