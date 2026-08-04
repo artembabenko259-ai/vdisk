@@ -10,6 +10,7 @@
 #include "qemu_linux.h"
 #include "save_disk.h"
 #include "accel.h"
+#include "packages.h"
 
 #define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
@@ -110,6 +111,10 @@ static void print_help(void) {
     printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\" --tools-net\n");
     printf("                                                 ...same, but from the full network apk repos\n");
     printf("  vdisk linux -s <DRIVE> --share                Bridge a Windows folder into the VM at /mnt/win (SMB)\n");
+    printf("  vdisk linux --package [list]                  Show your saved package favorites (empty by default)\n");
+    printf("  vdisk linux --package add <name>              Save a package name to the list\n");
+    printf("  vdisk linux --package del <name>              Remove it from the list\n");
+    printf("  vdisk linux --package set-defaults             Load a small starter set (git, curl, htop, ...)\n");
     printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
     printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
     printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
@@ -232,6 +237,19 @@ int main(int argc, char *argv[]) {
         //      --share bridges a stable Windows folder into the VM over SMB
         //      (see bridge.h -- not the disk itself, which Windows' SMB
         //      server can't see across the admin/non-admin session split).
+        // vdisk linux --package list|add <name>|del <name>|set-defaults
+        //   -> manage the personal favorites list (see packages.h); empty by
+        //      default, purely a reminder/convenience -- --tools works with
+        //      any package name regardless of what's saved here.
+        if (argc >= 3 && _stricmp(argv[2], "--package") == 0) {
+            const char *sub = (argc >= 4) ? argv[3] : "list";
+            const char *arg = (argc >= 5) ? argv[4] : NULL;
+            if (_stricmp(sub, "add") == 0) packages_add(arg);
+            else if (_stricmp(sub, "del") == 0 || _stricmp(sub, "remove") == 0) packages_del(arg);
+            else if (_stricmp(sub, "set-defaults") == 0) packages_set_defaults();
+            else packages_list();
+            return 0;
+        }
         if (argc >= 3 && _stricmp(argv[2], "-s") == 0) {
             char drive = 0;
             const char *tool = NULL;
