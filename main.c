@@ -105,6 +105,8 @@ static void print_help(void) {
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
     printf("  vdisk linux [DRIVE]                           Instant BusyBox Unix shell on a disk\n");
     printf("  vdisk linux -s <DRIVE>                        REAL Alpine Linux in QEMU (headless console)\n");
+    printf("  vdisk linux -s <DRIVE> --tools \"<name>\" --tools-net\n");
+    printf("                                                 ...and auto-install a tool via apk (e.g. PostgreSQL)\n");
     printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
     printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
     printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
@@ -208,10 +210,24 @@ int main(int argc, char *argv[]) {
     }
 
     if (_stricmp(action, "linux") == 0 || _stricmp(action, "sh") == 0 || _stricmp(action, "shell") == 0) {
-        // vdisk linux -s <DRIVE>  -> real Alpine Linux in QEMU (headless console)
+        // vdisk linux -s <DRIVE> [--tools "<name>"] [--tools-net]
+        //   -> real Alpine Linux in QEMU (headless console); --tools-net
+        //      auto-provisions the named tool via apk before handing over
+        //      the interactive shell (see qemu_linux.c for supported tools).
         if (argc >= 3 && _stricmp(argv[2], "-s") == 0) {
-            char drive = (argc >= 4) ? argv[3][0] : 0;
-            return qemu_run_linux(drive) ? 0 : 1;
+            char drive = 0;
+            const char *tool = NULL;
+            int tools_net = 0;
+            for (int i = 3; i < argc; i++) {
+                if (_stricmp(argv[i], "--tools") == 0 && i + 1 < argc) {
+                    tool = argv[++i];
+                } else if (_stricmp(argv[i], "--tools-net") == 0) {
+                    tools_net = 1;
+                } else if (!drive) {
+                    drive = argv[i][0];
+                }
+            }
+            return qemu_run_linux(drive, tool, tools_net) ? 0 : 1;
         }
         // vdisk linux [DRIVE]     -> instant BusyBox shell
         char drive = (argc >= 3) ? argv[2][0] : 0;
