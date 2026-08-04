@@ -1,9 +1,11 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "save_disk.h"
+#include "vdisk_util.h"
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 static unsigned long long g_files;
 static unsigned long long g_bytes;
@@ -109,4 +111,77 @@ int disk_save(char L, const char *dest, const char **items, int item_count) {
            g_files, (double)g_bytes / (1024.0 * 1024.0), dest,
            g_failed ? " (some items failed)" : "");
     return g_failed == 0;
+}
+
+// Parses e.g. "30sec", "10min", "hour", "2d" into seconds. A bare unit with
+// no leading digits means 1. Returns 0 on an unrecognized unit.
+static int parse_interval_seconds(const char *s, long *out_sec) {
+    if (!s || !*s) return 0;
+    char buf[64];
+    strcpy_s(buf, sizeof(buf), s);
+
+    char *p = buf;
+    long num = 0;
+    int has_digits = 0;
+    while (*p && isdigit((unsigned char)*p)) { num = num * 10 + (*p - '0'); p++; has_digits = 1; }
+    if (!has_digits) num = 1;
+    for (char *u = p; *u; u++) *u = (char)tolower((unsigned char)*u);
+
+    long mult;
+    if (strcmp(p, "s") == 0 || strncmp(p, "sec", 3) == 0) mult = 1;
+    else if (strcmp(p, "m") == 0 || strncmp(p, "min", 3) == 0) mult = 60;
+    else if (strcmp(p, "h") == 0 || strncmp(p, "hour", 4) == 0) mult = 3600;
+    else if (strcmp(p, "d") == 0 || strncmp(p, "day", 3) == 0) mult = 86400;
+    else return 0;
+
+    if (num <= 0) return 0;
+    *out_sec = num * mult;
+    return 1;
+}
+
+int disk_save_periodic(char L, const char *dest_arg, const char *interval_str) {
+    L = (char)toupper((unsigned char)L);
+    if (L < 'A' || L > 'Z') { printf("[vdisk] Invalid disk letter.\n"); return 0; }
+    if (!(GetLogicalDrives() & (1u << (L - 'A')))) {
+        printf("[vdisk] No disk mounted at %c:.\n", L);
+        return 0;
+    }
+
+    long interval_sec = 0;
+    if (!parse_interval_seconds(interval_str, &interval_sec)) {
+        printf("[vdisk] Bad --ev interval '%s'. Use e.g. 30sec, 10min, hour, 2day.\n", interval_str);
+        return 0;
+    }
+
+    char dest[MAX_PATH];
+    if (dest_arg && *dest_arg) {
+        strcpy_s(dest, sizeof(dest), dest_arg);
+    } else {
+        char datadir[MAX_PATH];
+        if (!get_data_dir(datadir, sizeof(datadir))) { printf("[vdisk] Data dir error.\n"); return 0; }
+        snprintf(dest, sizeof(dest), "%s\\autosave\\%c", datadir, L);
+    }
+
+    printf("[vdisk] Auto-saving %c:\\  ->  %s  every %ld sec.\n", L, dest, interval_sec);
+    printf("[vdisk] NOT true persistence -- the disk is still wiped on reboot; this is a\n");
+    printf("[vdisk] periodic snapshot. After remounting, copy %s\n", dest);
+    printf("[vdisk] back onto the fresh disk to restore it.\n");
+    printf("[vdisk] Leave this window running. Ctrl-C (or close it) to stop.\n\n");
+    fflush(stdout);
+
+    for (;;) {
+        if (!(GetLogicalDrives() & (1u << (L - 'A')))) {
+            printf("[vdisk] %c: is no longer mounted; stopping auto-save.\n", L);
+            fflush(stdout);
+            return 1;
+        }
+        time_t now = time(NULL);
+        struct tm tmv;
+        char tbuf[16] = {0};
+        if (localtime_s(&tmv, &now) == 0) strftime(tbuf, sizeof(tbuf), "%H:%M:%S", &tmv);
+        printf("[vdisk] [%s] auto-save tick...\n", tbuf);
+        disk_save(L, dest, NULL, 0);
+        fflush(stdout);
+        Sleep((DWORD)(interval_sec * 1000));
+    }
 }

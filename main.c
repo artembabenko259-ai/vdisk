@@ -102,6 +102,7 @@ static void print_help(void) {
     printf("  vdisk status                                  Show RAM/VRAM hardware info\n");
     printf("  vdisk save                                    Remember active disks for auto-mount\n");
     printf("  vdisk save <DISK> \"<DEST>\" [ITEM ...]          Copy data OUT of a disk (persist before wipe)\n");
+    printf("  vdisk save <DISK> [\"<DEST>\"] --ev <time>       Auto-save on a loop (30sec, 10min, hour, day, ...)\n");
     printf("  vdisk mount                                   Mount every disk in config\n");
     printf("  vdisk config                                  Show the config file\n");
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
@@ -190,19 +191,40 @@ int main(int argc, char *argv[]) {
 
     if (_stricmp(action, "save") == 0) {
         // No args  -> remember active disks for auto-mount (config).
+        // <DISK> [DEST] --ev <time> -> periodic auto-save loop (see below).
         // <DISK> <DEST> [ITEM ...] -> copy data OUT of a disk to a real path.
         if (argc <= 2) {
             disk_mgr_save_config();
             return 0;
         }
+        char disk = argv[2][0];
+
+        // vdisk save <DISK> [DEST] --ev <10min|hour|30sec|day|...>
+        //   -> not true persistence (RAM is still wiped on reboot), but a
+        //      periodic snapshot to a real folder while this keeps running;
+        //      DEST defaults to %LOCALAPPDATA%\vdisk\autosave\<DRIVE> (see
+        //      save_disk.c). Blocks until Ctrl-C or the disk is unmounted.
+        const char *ev_time = NULL;
+        const char *ev_dest = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (_stricmp(argv[i], "--ev") == 0 && i + 1 < argc) {
+                ev_time = argv[++i];
+            } else if (!ev_dest) {
+                ev_dest = argv[i];
+            }
+        }
+        if (ev_time) {
+            return disk_save_periodic(disk, ev_dest, ev_time) ? 0 : 1;
+        }
+
         if (argc < 4) {
             printf("Usage:\n");
             printf("  vdisk save                              remember active disks for auto-mount\n");
             printf("  vdisk save <DISK> \"<DEST>\" [ITEM ...]   copy data out of a disk to <DEST>\n");
             printf("                                          (no ITEM or '.' = the whole disk)\n");
+            printf("  vdisk save <DISK> [\"<DEST>\"] --ev <time>  periodic auto-save loop (30sec, 10min, hour, day, ...)\n");
             return 1;
         }
-        char disk = argv[2][0];
         const char *dest = argv[3];
         const char *items[64];
         int n = 0;
