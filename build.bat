@@ -35,7 +35,7 @@ rem winfsp-x64.dll is delay-loaded so the exe starts without it on PATH;
 rem FspLoad() (called at startup) loads it from the registry InstallDir.
 cl.exe /nologo /O2 /W3 ^
     /I "%WINFSP%inc" ^
-    main.c disk_manager.c vram_allocator.c vdisk_util.c fs_memfs.c linux_shell.c block_disk.c qemu_linux.c save_disk.c ^
+    main.c disk_manager.c vram_allocator.c vdisk_util.c fs_memfs.c linux_shell.c block_disk.c qemu_linux.c save_disk.c accel.c bridge.c ^
     "%WINFSP%lib\winfsp-x64.lib" urlmon.lib shell32.lib virtdisk.lib ^
     /Fe:vdisk.exe ^
     /link /DELAYLOAD:winfsp-x64.dll delayimp.lib advapi32.lib

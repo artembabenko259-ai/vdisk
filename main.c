@@ -9,6 +9,7 @@
 #include "block_disk.h"
 #include "qemu_linux.h"
 #include "save_disk.h"
+#include "accel.h"
 
 #define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
@@ -108,11 +109,14 @@ static void print_help(void) {
     printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\"          ...and auto-install any apk package (local boot image)\n");
     printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\" --tools-net\n");
     printf("                                                 ...same, but from the full network apk repos\n");
+    printf("  vdisk linux -s <DRIVE> --share                Bridge a Windows folder into the VM at /mnt/win (SMB)\n");
     printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
     printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
     printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
     printf("  vdisk disk remove <DRIVE>                     Detach it (and its backing if RAM/VRAM one-step)\n");
     printf("  vdisk disk list                               List physical block disks\n");
+    printf("  vdisk accel [status]                          Check hardware VM acceleration (no admin)\n");
+    printf("  vdisk accel enable                            Turn it on (needs admin + a one-time reboot)\n");
     printf("  vdisk help                                    Display this help menu\n\n");
     printf("EXAMPLES:\n");
     printf("  vdisk create ram 512M R:            512 MB RAM disk on R:\n");
@@ -210,25 +214,48 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    if (_stricmp(action, "accel") == 0) {
+        const char *sub = (argc >= 3) ? argv[2] : "status";
+        if (_stricmp(sub, "enable") == 0) {
+            if (!is_user_admin()) return relaunch_as_admin(argc, argv) ? 0 : 1;
+            return accel_enable() ? 0 : 1;
+        }
+        accel_status();
+        return 0;
+    }
+
     if (_stricmp(action, "linux") == 0 || _stricmp(action, "sh") == 0 || _stricmp(action, "shell") == 0) {
-        // vdisk linux -s <DRIVE> [--tools "<name>"] [--tools-net]
+        // vdisk linux -s <DRIVE> [--tools "<name>"] [--tools-net] [--share]
         //   -> real Alpine Linux in QEMU (headless console); --tools-net
         //      auto-provisions the named tool via apk before handing over
-        //      the interactive shell (see qemu_linux.c for supported tools).
+        //      the interactive shell (see qemu_linux.c for supported tools);
+        //      --share bridges a stable Windows folder into the VM over SMB
+        //      (see bridge.h -- not the disk itself, which Windows' SMB
+        //      server can't see across the admin/non-admin session split).
         if (argc >= 3 && _stricmp(argv[2], "-s") == 0) {
             char drive = 0;
             const char *tool = NULL;
             int tools_net = 0;
+            int want_share = 0;
             for (int i = 3; i < argc; i++) {
                 if (_stricmp(argv[i], "--tools") == 0 && i + 1 < argc) {
                     tool = argv[++i];
                 } else if (_stricmp(argv[i], "--tools-net") == 0) {
                     tools_net = 1;
+                } else if (_stricmp(argv[i], "--share") == 0) {
+                    want_share = 1;
                 } else if (!drive) {
                     drive = argv[i][0];
                 }
             }
-            return qemu_run_linux(drive, tool, tools_net) ? 0 : 1;
+            // --share needs Administrator for ONE step (creating the SMB
+            // share) -- but elevating this WHOLE process would make it lose
+            // sight of the vdisk (RAM disk letters are only visible in the
+            // session that mounted them, not an elevated one of the same
+            // user). So we deliberately stay unelevated here; bridge.c
+            // elevates only that one narrow step, in a separate short-lived
+            // process, then hands control straight back.
+            return qemu_run_linux(drive, tool, tools_net, want_share) ? 0 : 1;
         }
         // vdisk linux [DRIVE]     -> instant BusyBox shell
         char drive = (argc >= 3) ? argv[2][0] : 0;

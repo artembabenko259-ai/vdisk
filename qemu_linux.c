@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "qemu_linux.h"
 #include "vdisk_util.h"
+#include "bridge.h"
 #include <windows.h>
 #include <urlmon.h>
 #include <stdio.h>
@@ -252,7 +253,7 @@ static int outbuf_last_int_after(outbuf_t *buf, const char *needle) {
 
 // ---------------------------------------------------------------------------
 
-int qemu_run_linux(char L, const char *tool_name, int tools_net) {
+int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share) {
     L = (char)toupper((unsigned char)L);
     if (L < 'A' || L > 'Z') {
         printf("[vdisk] Specify a drive: 'vdisk linux -s <DRIVE>' (mount it first with 'vdisk create ram 2G <DRIVE>').\n");
@@ -267,6 +268,20 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
     // name; otherwise 'tool_name' is used as-is as a raw apk package name --
     // --tools works for any package, not just the ones with a recipe.
     const tool_recipe_t *recipe = tool_name ? find_tool_recipe(tool_name) : NULL;
+
+    // Bridge setup happens up front, before spending time booting the VM:
+    // create/confirm the SMB share (caller must already be elevated for
+    // this) and get the password we'll hand the guest for its one mount.
+    char share_name[32] = {0}, share_user[256] = {0}, share_pass[256] = {0};
+    if (want_share) {
+        if (!bridge_ensure_share(share_name, sizeof(share_name))) return 0;
+        DWORD ulen = sizeof(share_user);
+        GetUserNameA(share_user, &ulen);
+        if (!bridge_prompt_password(share_pass, sizeof(share_pass))) {
+            printf("[vdisk] No password entered; aborting.\n");
+            return 0;
+        }
+    }
 
     const char *q = qemu_path();
     if (!q[0]) {
@@ -328,22 +343,28 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
         }
     }
 
-    // Give a tool install some headroom over the bare-shell default even
-    // without a recipe (we don't know an arbitrary package's footprint).
+    // Give a tool install (or the bridge's cifs-utils) some headroom over the
+    // bare-shell default even without a recipe (we don't know an arbitrary
+    // package's footprint).
     unsigned long long vm_ram_mb = recipe ? recipe->vm_ram_mb
-                                  : tool_name ? 1280 : DEFAULT_VM_RAM_MB;
+                                  : (tool_name || want_share) ? 1280 : DEFAULT_VM_RAM_MB;
 
+    // Repeated -accel flags are QEMU's documented fallback chain: it tries
+    // whpx first and silently falls back to tcg if Windows Hypervisor
+    // Platform isn't enabled (confirmed: prints a couple of warning lines and
+    // proceeds normally either way) -- so this is always safe to pass, no
+    // pre-check needed. 'vdisk accel enable' is what actually turns on whpx.
     char cmd[2048];
     if (have_img) {
         snprintf(cmd, sizeof(cmd),
-                 "\"%s\" -accel tcg -M pc -m %llu -smp 2 -nographic "
+                 "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
                  "-kernel \"%s\" -initrd \"%s\" "
                  "-append \"console=ttyS0 modloop=/boot/modloop-virt quiet\" "
                  "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
                  q, vm_ram_mb, kernel, initrd, iso, img);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "\"%s\" -accel tcg -M pc -m %llu -smp 2 -nographic "
+                 "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
                  "-kernel \"%s\" -initrd \"%s\" "
                  "-append \"console=ttyS0 modloop=/boot/modloop-virt quiet\" "
                  "-cdrom \"%s\"",
@@ -356,7 +377,13 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
     if (tool_name) {
         printf(" Auto-installing: %s%s (this can take a few minutes under software emulation)\n",
                tool_name, tools_net ? " (from the network)" : " (from the local boot image only)");
-    } else {
+    }
+    if (want_share) {
+        char bridgepath[MAX_PATH];
+        bridge_folder_path(bridgepath, sizeof(bridgepath));
+        printf(" Bridging %s into the VM at /mnt/win (share '%s').\n", bridgepath, share_name);
+    }
+    if (!tool_name && !want_share) {
         printf(" Login: root  (no password).%s\n", have_img ? "  Disk is /dev/vda inside Linux." : "");
     }
     printf(" To leave: type 'poweroff'  (or press Ctrl-A then X to kill QEMU).\n");
@@ -364,7 +391,7 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
     printf("=====================================================================\n\n");
     fflush(stdout);
 
-    if (!tool_name) {
+    if (!tool_name && !want_share) {
         // Plain shell: inherit the console directly for a fully native terminal.
         STARTUPINFOA si = { sizeof(si) };
         PROCESS_INFORMATION pi = {0};
@@ -442,52 +469,66 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
         // actually finishes.)
         const char *marker = "/tmp/vdisk_provision_ok";
         const char *rcfile = "/tmp/vdisk-apk-install.rc";
+        const char *mountrc = "/tmp/vdisk-mount.rc";
+        // Networking is needed for a full apk-repo install OR the SMB bridge
+        // (both go out through the same SLIRP gateway); a local-only tool
+        // install needs neither.
+        int need_network = tools_net || want_share;
 
         // A curated recipe supplies its own packages + extra setup; otherwise
         // 'tool_name' IS the apk package, and we make a best-effort attempt to
         // start it as an OpenRC service afterwards ("|| true": harmless no-op
         // for plain CLI tools that have no service to start).
-        char generic_script[192];
+        char generic_script[192] = "";
         const char *apk_packages = recipe ? recipe->apk_packages : tool_name;
-        const char *provision_script;
-        if (recipe) {
-            provision_script = recipe->provision_script;
-        } else {
-            snprintf(generic_script, sizeof(generic_script),
-                     "rc-service %s start >/tmp/vdisk-service-start.log 2>&1 || true; ", tool_name);
-            provision_script = generic_script;
+        const char *provision_script = "";
+        if (tool_name) {
+            if (recipe) {
+                provision_script = recipe->provision_script;
+            } else {
+                snprintf(generic_script, sizeof(generic_script),
+                         "rc-service %s start >/tmp/vdisk-service-start.log 2>&1 || true; ", tool_name);
+                provision_script = generic_script;
+            }
         }
 
+        // Built up piece by piece so each of --tools / --tools-net / --share
+        // can be present independently of the others.
         char provcmd[4096];
+        strcpy_s(provcmd, sizeof(provcmd), "( ");
+        if (need_network) {
+            strcat_s(provcmd, sizeof(provcmd), "ip link set eth0 up; udhcpc -i eth0 -q -n; ");
+        }
         if (tools_net) {
-            // Full network install: bring up networking and add the CDN repos
-            // so the whole apk index (tens of thousands of packages) is reachable.
-            snprintf(provcmd, sizeof(provcmd),
-                     "( ip link set eth0 up; udhcpc -i eth0 -q -n; "
-                     "echo %s >> /etc/apk/repositories; "
-                     "echo %s >> /etc/apk/repositories; "
-                     "apk update >/tmp/vdisk-apk-update.log 2>&1; "
-                     "apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; echo $? >%s; "
-                     "%s"
-                     "touch %s ) >/tmp/vdisk-provision.log 2>&1 &\n",
-                     ALPINE_REPO_MAIN, ALPINE_REPO_COMMUNITY,
-                     apk_packages, rcfile, provision_script, marker);
-        } else {
-            // Local only: whatever's already on the boot ISO (~100 packages),
-            // no network and no --tools-net needed -- and near-instant.
-            snprintf(provcmd, sizeof(provcmd),
-                     "( apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; echo $? >%s; "
-                     "%s"
-                     "touch %s ) >/tmp/vdisk-provision.log 2>&1 &\n",
-                     apk_packages, rcfile, provision_script, marker);
+            char repopart[400];
+            snprintf(repopart, sizeof(repopart),
+                     "echo %s >> /etc/apk/repositories; echo %s >> /etc/apk/repositories; "
+                     "apk update >/tmp/vdisk-apk-update.log 2>&1; ",
+                     ALPINE_REPO_MAIN, ALPINE_REPO_COMMUNITY);
+            strcat_s(provcmd, sizeof(provcmd), repopart);
+        }
+        if (tool_name) {
+            char installpart[700];
+            snprintf(installpart, sizeof(installpart),
+                     "apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; echo $? >%s; %s",
+                     apk_packages, rcfile, provision_script);
+            strcat_s(provcmd, sizeof(provcmd), installpart);
+        }
+        if (want_share) {
+            bridge_append_mount_cmd(provcmd, sizeof(provcmd), share_name, share_user, share_pass);
+        }
+        {
+            char touchpart[64];
+            snprintf(touchpart, sizeof(touchpart), "touch %s ) >/tmp/vdisk-provision.log 2>&1 &\n", marker);
+            strcat_s(provcmd, sizeof(provcmd), touchpart);
         }
         pipe_send(hChildStdinW, provcmd);
         Sleep(1000); // let the backgrounding itself settle before we probe
 
-        // Network installs over TCG can be slow (observed variance on a loaded
-        // host); local-only installs need no such allowance.
+        // Network work over TCG can be slow (observed variance on a loaded
+        // host); a purely local-only tool install needs no such allowance.
         int prov_ok = 0;
-        DWORD budget_ms = tools_net ? 600000 : 60000;
+        DWORD budget_ms = need_network ? 600000 : 60000;
         DWORD deadline = GetTickCount() + budget_ms;
         while (GetTickCount() < deadline) {
             if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
@@ -501,29 +542,49 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
             // existed and && actually ran it.
             pipe_send(hChildStdinW, probe);
             if (wait_for_nth(&buf, hit, 2, 8000, pi.hProcess)) { prov_ok = 1; break; }
-            Sleep(tools_net ? 7000 : 2000); // don't send the next probe until well after this one settled
+            Sleep(need_network ? 7000 : 2000); // don't send the next probe until well after this one settled
         }
 
         if (!prov_ok) {
-            printf("\n[vdisk] Warning: provisioning '%s' did not confirm completion in time.\n", tool_name);
-            printf("[vdisk] Dropping into the shell anyway -- check /tmp/vdisk-apk-*.log inside the VM.\n\n");
+            printf("\n[vdisk] Warning: provisioning did not confirm completion in time.\n");
+            printf("[vdisk] Dropping into the shell anyway -- check /tmp/vdisk-*.log inside the VM.\n\n");
         } else {
-            // One more short probe: did `apk add` actually succeed?
-            char rcprobe[96], rctag[48];
-            snprintf(rctag, sizeof(rctag), "VDISK_RC_%lu", GetTickCount());
-            snprintf(rcprobe, sizeof(rcprobe), "echo %s:$(cat %s)\n", rctag, rcfile);
-            pipe_send(hChildStdinW, rcprobe);
-            wait_for_nth(&buf, rctag, 2, 6000, pi.hProcess);
-            int rc = outbuf_last_int_after(&buf, rctag);
+            if (tool_name) {
+                // Short probe: did `apk add` actually succeed?
+                char rcprobe[96], rctag[48];
+                snprintf(rctag, sizeof(rctag), "VDISK_RC_%lu", GetTickCount());
+                snprintf(rcprobe, sizeof(rcprobe), "echo %s:$(cat %s)\n", rctag, rcfile);
+                pipe_send(hChildStdinW, rcprobe);
+                wait_for_nth(&buf, rctag, 2, 6000, pi.hProcess);
+                int rc = outbuf_last_int_after(&buf, rctag);
 
-            if (rc == 0) {
-                printf("\n[vdisk] '%s' installed. You now have an interactive shell.\n", tool_name);
-            } else {
-                printf("\n[vdisk] Warning: 'apk add %s' failed (exit code %d) -- misspelled, or not in the%s repos?\n",
-                       apk_packages, rc, tools_net ? "" : " local boot image (try --tools-net)");
-                printf("[vdisk] Dropping into the shell anyway -- check /tmp/vdisk-apk-install.log inside the VM.\n");
+                if (rc == 0) {
+                    printf("\n[vdisk] '%s' installed.\n", tool_name);
+                } else {
+                    printf("\n[vdisk] Warning: 'apk add %s' failed (exit code %d) -- misspelled, or not in the%s repos?\n",
+                           apk_packages, rc, tools_net ? "" : " local boot image (try --tools-net)");
+                    printf("[vdisk] Check /tmp/vdisk-apk-install.log inside the VM.\n");
+                }
             }
-            printf("[vdisk] Type 'poweroff' (or Ctrl-A then X) to exit.\n\n");
+            if (want_share) {
+                // Short probe: did the cifs mount actually succeed?
+                char rcprobe[96], rctag[48];
+                snprintf(rctag, sizeof(rctag), "VDISK_MNT_%lu", GetTickCount());
+                snprintf(rcprobe, sizeof(rcprobe), "echo %s:$(cat %s 2>/dev/null)\n", rctag, mountrc);
+                pipe_send(hChildStdinW, rcprobe);
+                wait_for_nth(&buf, rctag, 2, 6000, pi.hProcess);
+                int rc = outbuf_last_int_after(&buf, rctag);
+
+                if (rc == 0) {
+                    char bridgepath[MAX_PATH];
+                    bridge_folder_path(bridgepath, sizeof(bridgepath));
+                    printf("[vdisk] Bridge mounted: /mnt/win inside the VM = %s on Windows.\n", bridgepath);
+                } else {
+                    printf("[vdisk] Warning: the SMB mount failed (exit code %d) -- wrong password?\n", rc);
+                    printf("[vdisk] Check /tmp/vdisk-mount.log inside the VM.\n");
+                }
+            }
+            printf("\n[vdisk] You now have an interactive shell. Type 'poweroff' (or Ctrl-A then X) to exit.\n\n");
         }
         fflush(stdout);
     }
