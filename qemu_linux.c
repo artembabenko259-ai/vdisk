@@ -54,10 +54,18 @@ static int run_wait(const char *cmdline) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool profiles: what --tools <name> --tools-net provisions automatically.
-// Data lives on tmpfs (the VM's own RAM), not the vdisk-backed /dev/vda, so it
-// runs at RAM speed with no virtio-blk/WinFsp overhead -- and vanishes with
-// the VM, like everything else in this project.
+// --tools <name> --tools-net installs ANY apk package by that name -- "name"
+// is passed straight to `apk add` for anything not listed below. Data lives
+// on tmpfs (the VM's own RAM), not the vdisk-backed /dev/vda, so it runs at
+// RAM speed with no virtio-blk/WinFsp overhead -- and vanishes with the VM,
+// like everything else in this project.
+//
+// Plain CLI packages (git, htop, python3, ffmpeg, ...) need nothing beyond
+// `apk add`; we also make a best-effort `rc-service <name> start` afterwards
+// in case the package ships an OpenRC service, silently ignored if it
+// doesn't. A handful of packages need real first-run bootstrap before they
+// can start at all (initdb for Postgres, etc.) -- those get a curated
+// "recipe" here instead of the generic path. Add more as needed.
 // ---------------------------------------------------------------------------
 
 typedef struct {
@@ -65,9 +73,9 @@ typedef struct {
     unsigned long long vm_ram_mb;   // total VM RAM (must cover OS + packages + tmpfs data)
     const char *apk_packages;       // space-separated apk package list
     const char *provision_script;   // shell commands run after the packages install
-} tool_profile_t;
+} tool_recipe_t;
 
-static const tool_profile_t g_tool_profiles[] = {
+static const tool_recipe_t g_tool_recipes[] = {
     {
         "postgresql",
         1536,
@@ -89,12 +97,12 @@ static const tool_profile_t g_tool_profiles[] = {
         "su postgres -c 'pg_ctl -D /var/lib/postgresql/16/data -l /var/lib/postgresql/16/data/postgresql.log -t 120 start' >/tmp/vdisk-pgctl.log 2>&1; "
     },
 };
-#define TOOL_PROFILE_COUNT (sizeof(g_tool_profiles) / sizeof(g_tool_profiles[0]))
+#define TOOL_RECIPE_COUNT (sizeof(g_tool_recipes) / sizeof(g_tool_recipes[0]))
 
-static const tool_profile_t *find_tool_profile(const char *name) {
+static const tool_recipe_t *find_tool_recipe(const char *name) {
     if (!name) return NULL;
-    for (size_t i = 0; i < TOOL_PROFILE_COUNT; i++)
-        if (_stricmp(g_tool_profiles[i].name, name) == 0) return &g_tool_profiles[i];
+    for (size_t i = 0; i < TOOL_RECIPE_COUNT; i++)
+        if (_stricmp(g_tool_recipes[i].name, name) == 0) return &g_tool_recipes[i];
     return NULL;
 }
 
@@ -225,22 +233,21 @@ static size_t outbuf_length(outbuf_t *b) {
     return l;
 }
 
-// Waits until 'needle' appears at or after byte offset 'from', ignoring any
-// earlier occurrence. Used so a long command's own echoed input (which
-// contains whatever we typed, including any sentinel) can never be mistaken
-// for its real output -- the caller passes the buffer length from just before
-// sending, and this only looks at what arrived after.
-static int wait_for_needle_after(outbuf_t *buf, const char *needle, size_t from, DWORD timeout_ms, HANDLE hProcess) {
-    DWORD start = GetTickCount();
-    while (GetTickCount() - start < timeout_ms) {
-        EnterCriticalSection(&buf->lock);
-        int found = (buf->len > from) && (strstr(buf->data + from, needle) != NULL);
-        LeaveCriticalSection(&buf->lock);
-        if (found) return 1;
-        if (WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) return 0;
-        Sleep(300);
+// Finds the LAST occurrence of "needle:" in the buffer and parses the integer
+// right after the colon. Used to read back a probe's "TOKEN:<value>" reply
+// (the last occurrence is always the real one -- any earlier one is just the
+// probe's own echoed input, which has no colon/value after it yet).
+static int outbuf_last_int_after(outbuf_t *buf, const char *needle) {
+    int rc = -1;
+    EnterCriticalSection(&buf->lock);
+    const char *hit = NULL, *p = buf->data, *next;
+    while ((next = strstr(p, needle)) != NULL) { hit = next; p = next + 1; }
+    if (hit) {
+        const char *after = hit + strlen(needle);
+        if (*after == ':') rc = atoi(after + 1);
     }
-    return 0;
+    LeaveCriticalSection(&buf->lock);
+    return rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -256,19 +263,10 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
         return 0;
     }
 
-    const tool_profile_t *profile = NULL;
-    if (tool_name) {
-        profile = find_tool_profile(tool_name);
-        if (!profile) {
-            printf("[vdisk] Unknown tool '%s'. Available: PostgreSQL.\n", tool_name);
-            return 0;
-        }
-        if (!tools_net) {
-            printf("[vdisk] --tools requires --tools-net right now (the only supported source).\n");
-            printf("[vdisk] Try: vdisk linux -s %c --tools \"%s\" --tools-net\n", L, tool_name);
-            return 0;
-        }
-    }
+    // A curated recipe (extra setup beyond `apk add`) if we have one for this
+    // name; otherwise 'tool_name' is used as-is as a raw apk package name --
+    // --tools works for any package, not just the ones with a recipe.
+    const tool_recipe_t *recipe = tool_name ? find_tool_recipe(tool_name) : NULL;
 
     const char *q = qemu_path();
     if (!q[0]) {
@@ -326,7 +324,10 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
         }
     }
 
-    unsigned long long vm_ram_mb = profile ? profile->vm_ram_mb : DEFAULT_VM_RAM_MB;
+    // Give a tool install some headroom over the bare-shell default even
+    // without a recipe (we don't know an arbitrary package's footprint).
+    unsigned long long vm_ram_mb = recipe ? recipe->vm_ram_mb
+                                  : tool_name ? 1280 : DEFAULT_VM_RAM_MB;
 
     char cmd[2048];
     if (have_img) {
@@ -348,8 +349,9 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
     printf("\n");
     printf("=====================================================================\n");
     printf(" vdisk linux -s %c  --  REAL Alpine Linux in QEMU (headless console)\n", L);
-    if (profile) {
-        printf(" Auto-installing: %s (this can take a few minutes under software emulation)\n", profile->name);
+    if (tool_name) {
+        printf(" Auto-installing: %s%s (this can take a few minutes under software emulation)\n",
+               tool_name, tools_net ? " (from the network)" : " (from the local boot image only)");
     } else {
         printf(" Login: root  (no password).%s\n", have_img ? "  Disk is /dev/vda inside Linux." : "");
     }
@@ -358,7 +360,7 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
     printf("=====================================================================\n\n");
     fflush(stdout);
 
-    if (!profile) {
+    if (!tool_name) {
         // Plain shell: inherit the console directly for a fully native terminal.
         STARTUPINFOA si = { sizeof(si) };
         PROCESS_INFORMATION pi = {0};
@@ -435,24 +437,54 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
         // we never answer its cursor-position query, well before the chain
         // actually finishes.)
         const char *marker = "/tmp/vdisk_provision_ok";
+        const char *rcfile = "/tmp/vdisk-apk-install.rc";
+
+        // A curated recipe supplies its own packages + extra setup; otherwise
+        // 'tool_name' IS the apk package, and we make a best-effort attempt to
+        // start it as an OpenRC service afterwards ("|| true": harmless no-op
+        // for plain CLI tools that have no service to start).
+        char generic_script[192];
+        const char *apk_packages = recipe ? recipe->apk_packages : tool_name;
+        const char *provision_script;
+        if (recipe) {
+            provision_script = recipe->provision_script;
+        } else {
+            snprintf(generic_script, sizeof(generic_script),
+                     "rc-service %s start >/tmp/vdisk-service-start.log 2>&1 || true; ", tool_name);
+            provision_script = generic_script;
+        }
+
         char provcmd[4096];
-        snprintf(provcmd, sizeof(provcmd),
-                 "( ip link set eth0 up; udhcpc -i eth0 -q -n; "
-                 "echo %s >> /etc/apk/repositories; "
-                 "echo %s >> /etc/apk/repositories; "
-                 "apk update >/tmp/vdisk-apk-update.log 2>&1; "
-                 "apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; "
-                 "%s"
-                 "touch %s ) >/tmp/vdisk-provision.log 2>&1 &\n",
-                 ALPINE_REPO_MAIN, ALPINE_REPO_COMMUNITY,
-                 profile->apk_packages, profile->provision_script, marker);
+        if (tools_net) {
+            // Full network install: bring up networking and add the CDN repos
+            // so the whole apk index (tens of thousands of packages) is reachable.
+            snprintf(provcmd, sizeof(provcmd),
+                     "( ip link set eth0 up; udhcpc -i eth0 -q -n; "
+                     "echo %s >> /etc/apk/repositories; "
+                     "echo %s >> /etc/apk/repositories; "
+                     "apk update >/tmp/vdisk-apk-update.log 2>&1; "
+                     "apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; echo $? >%s; "
+                     "%s"
+                     "touch %s ) >/tmp/vdisk-provision.log 2>&1 &\n",
+                     ALPINE_REPO_MAIN, ALPINE_REPO_COMMUNITY,
+                     apk_packages, rcfile, provision_script, marker);
+        } else {
+            // Local only: whatever's already on the boot ISO (~100 packages),
+            // no network and no --tools-net needed -- and near-instant.
+            snprintf(provcmd, sizeof(provcmd),
+                     "( apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; echo $? >%s; "
+                     "%s"
+                     "touch %s ) >/tmp/vdisk-provision.log 2>&1 &\n",
+                     apk_packages, rcfile, provision_script, marker);
+        }
         pipe_send(hChildStdinW, provcmd);
         Sleep(1000); // let the backgrounding itself settle before we probe
 
-        // Network install over TCG can be slow (observed variance on a loaded
-        // host); poll for the marker file with a generous overall budget.
+        // Network installs over TCG can be slow (observed variance on a loaded
+        // host); local-only installs need no such allowance.
         int prov_ok = 0;
-        DWORD deadline = GetTickCount() + 600000;
+        DWORD budget_ms = tools_net ? 600000 : 60000;
+        DWORD deadline = GetTickCount() + budget_ms;
         while (GetTickCount() < deadline) {
             if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
             char probe[128], hit[48];
@@ -465,13 +497,28 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net) {
             // existed and && actually ran it.
             pipe_send(hChildStdinW, probe);
             if (wait_for_nth(&buf, hit, 2, 8000, pi.hProcess)) { prov_ok = 1; break; }
-            Sleep(7000); // don't send the next probe until well after this one settled
+            Sleep(tools_net ? 7000 : 2000); // don't send the next probe until well after this one settled
         }
+
         if (!prov_ok) {
-            printf("\n[vdisk] Warning: '%s' provisioning did not confirm completion in time.\n", profile->name);
+            printf("\n[vdisk] Warning: provisioning '%s' did not confirm completion in time.\n", tool_name);
             printf("[vdisk] Dropping into the shell anyway -- check /tmp/vdisk-apk-*.log inside the VM.\n\n");
         } else {
-            printf("\n[vdisk] %s is ready. You now have an interactive shell.\n", profile->name);
+            // One more short probe: did `apk add` actually succeed?
+            char rcprobe[96], rctag[48];
+            snprintf(rctag, sizeof(rctag), "VDISK_RC_%lu", GetTickCount());
+            snprintf(rcprobe, sizeof(rcprobe), "echo %s:$(cat %s)\n", rctag, rcfile);
+            pipe_send(hChildStdinW, rcprobe);
+            wait_for_nth(&buf, rctag, 2, 6000, pi.hProcess);
+            int rc = outbuf_last_int_after(&buf, rctag);
+
+            if (rc == 0) {
+                printf("\n[vdisk] '%s' installed. You now have an interactive shell.\n", tool_name);
+            } else {
+                printf("\n[vdisk] Warning: 'apk add %s' failed (exit code %d) -- misspelled, or not in the%s repos?\n",
+                       apk_packages, rc, tools_net ? "" : " local boot image (try --tools-net)");
+                printf("[vdisk] Dropping into the shell anyway -- check /tmp/vdisk-apk-install.log inside the VM.\n");
+            }
             printf("[vdisk] Type 'poweroff' (or Ctrl-A then X) to exit.\n\n");
         }
         fflush(stdout);

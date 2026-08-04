@@ -105,8 +105,9 @@ static void print_help(void) {
     printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
     printf("  vdisk linux [DRIVE]                           Instant BusyBox Unix shell on a disk\n");
     printf("  vdisk linux -s <DRIVE>                        REAL Alpine Linux in QEMU (headless console)\n");
-    printf("  vdisk linux -s <DRIVE> --tools \"<name>\" --tools-net\n");
-    printf("                                                 ...and auto-install a tool via apk (e.g. PostgreSQL)\n");
+    printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\"          ...and auto-install any apk package (local boot image)\n");
+    printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\" --tools-net\n");
+    printf("                                                 ...same, but from the full network apk repos\n");
     printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
     printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
     printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
