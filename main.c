@@ -111,6 +111,7 @@ static void print_help(void) {
     printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\" --tools-net\n");
     printf("                                                 ...same, but from the full network apk repos\n");
     printf("  vdisk linux -s <DRIVE> --share                Bridge a Windows folder into the VM at /mnt/win (SMB)\n");
+    printf("  vdisk linux -s <DRIVE> -image <path>          Boot any ISO (own bootloader), not just Alpine\n");
     printf("  vdisk linux --package [list]                  Show your saved package favorites (empty by default)\n");
     printf("  vdisk linux --package add <name>              Save a package name to the list\n");
     printf("  vdisk linux --package del <name>              Remove it from the list\n");
@@ -253,6 +254,7 @@ int main(int argc, char *argv[]) {
         if (argc >= 3 && _stricmp(argv[2], "-s") == 0) {
             char drive = 0;
             const char *tool = NULL;
+            const char *image = NULL;
             int tools_net = 0;
             int want_share = 0;
             for (int i = 3; i < argc; i++) {
@@ -262,9 +264,16 @@ int main(int argc, char *argv[]) {
                     tools_net = 1;
                 } else if (_stricmp(argv[i], "--share") == 0) {
                     want_share = 1;
+                } else if (_stricmp(argv[i], "-image") == 0 && i + 1 < argc) {
+                    image = argv[++i];
                 } else if (!drive) {
                     drive = argv[i][0];
                 }
+            }
+            if (image && (tool || want_share)) {
+                printf("[vdisk] -image can't be combined with --tools/--tools-net/--share "
+                       "(those assume the built-in Alpine image).\n");
+                return 1;
             }
             // --share needs Administrator for ONE step (creating the SMB
             // share) -- but elevating this WHOLE process would make it lose
@@ -273,7 +282,7 @@ int main(int argc, char *argv[]) {
             // user). So we deliberately stay unelevated here; bridge.c
             // elevates only that one narrow step, in a separate short-lived
             // process, then hands control straight back.
-            return qemu_run_linux(drive, tool, tools_net, want_share) ? 0 : 1;
+            return qemu_run_linux(drive, tool, tools_net, want_share, image) ? 0 : 1;
         }
         // vdisk linux [DRIVE]     -> instant BusyBox shell
         char drive = (argc >= 3) ? argv[2][0] : 0;

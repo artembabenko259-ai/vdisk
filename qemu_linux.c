@@ -253,7 +253,8 @@ static int outbuf_last_int_after(outbuf_t *buf, const char *needle) {
 
 // ---------------------------------------------------------------------------
 
-int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share) {
+int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
+                    const char *image_path) {
     L = (char)toupper((unsigned char)L);
     if (L < 'A' || L > 'Z') {
         printf("[vdisk] Specify a drive: 'vdisk linux -s <DRIVE>' (mount it first with 'vdisk create ram 2G <DRIVE>').\n");
@@ -261,6 +262,17 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share)
     }
     if (!(GetLogicalDrives() & (1u << (L - 'A')))) {
         printf("[vdisk] No vdisk mounted at %c:. Mount one first: 'vdisk create ram 2G %c:'.\n", L, L);
+        return 0;
+    }
+    // A custom image is an unknown OS/boot flow -- we can't assume a login
+    // prompt, shell, or apk exist to automate against.
+    if (image_path && (tool_name || want_share)) {
+        printf("[vdisk] -image can't be combined with --tools/--tools-net/--share "
+               "(those assume the built-in Alpine image).\n");
+        return 0;
+    }
+    if (image_path && !file_exists(image_path)) {
+        printf("[vdisk] Image not found: %s\n", image_path);
         return 0;
     }
 
@@ -292,37 +304,49 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share)
     char dir[MAX_PATH];
     if (!get_data_dir(dir, sizeof(dir))) { printf("[vdisk] Data dir error.\n"); return 0; }
 
+    int custom_image = (image_path != NULL);
     char iso[MAX_PATH], bootdir[MAX_PATH], kernel[MAX_PATH], initrd[MAX_PATH];
-    snprintf(iso, sizeof(iso), "%s\\alpine-virt.iso", dir);
-    snprintf(bootdir, sizeof(bootdir), "%s\\alpine-boot", dir);
-    snprintf(kernel, sizeof(kernel), "%s\\boot\\vmlinuz-virt", bootdir);
-    snprintf(initrd, sizeof(initrd), "%s\\boot\\initramfs-virt", bootdir);
 
-    // Download Alpine ISO once.
-    if (!file_exists(iso)) {
-        printf("[vdisk] Downloading Alpine Linux (~60 MB, one time)...\n");
-        if (URLDownloadToFileA(NULL, ALPINE_ISO_URL, iso, 0, NULL) != S_OK) {
-            printf("[vdisk] Failed to download Alpine ISO.\n");
-            return 0;
+    if (custom_image) {
+        // An arbitrary ISO boots via its own bootloader (-cdrom), not our
+        // direct-kernel-boot trick, which only knows how to extract and drive
+        // Alpine's specific kernel/initramfs.
+        strcpy_s(iso, sizeof(iso), image_path);
+    } else {
+        snprintf(iso, sizeof(iso), "%s\\alpine-virt.iso", dir);
+        snprintf(bootdir, sizeof(bootdir), "%s\\alpine-boot", dir);
+        snprintf(kernel, sizeof(kernel), "%s\\boot\\vmlinuz-virt", bootdir);
+        snprintf(initrd, sizeof(initrd), "%s\\boot\\initramfs-virt", bootdir);
+
+        // Download Alpine ISO once.
+        if (!file_exists(iso)) {
+            printf("[vdisk] Downloading Alpine Linux (~60 MB, one time)...\n");
+            if (URLDownloadToFileA(NULL, ALPINE_ISO_URL, iso, 0, NULL) != S_OK) {
+                printf("[vdisk] Failed to download Alpine ISO.\n");
+                return 0;
+            }
         }
-    }
 
-    // Extract the ISO's own kernel + initramfs (they know how to mount the CD).
-    if (!file_exists(kernel) || !file_exists(initrd)) {
-        printf("[vdisk] Preparing kernel (first run)...\n");
-        CreateDirectoryA(bootdir, NULL);
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" boot", iso, bootdir);
-        run_wait(cmd);
+        // Extract the ISO's own kernel + initramfs (they know how to mount the CD).
         if (!file_exists(kernel) || !file_exists(initrd)) {
-            printf("[vdisk] Failed to extract the kernel from the ISO.\n");
-            return 0;
+            printf("[vdisk] Preparing kernel (first run)...\n");
+            CreateDirectoryA(bootdir, NULL);
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\" boot", iso, bootdir);
+            run_wait(cmd);
+            if (!file_exists(kernel) || !file_exists(initrd)) {
+                printf("[vdisk] Failed to extract the kernel from the ISO.\n");
+                return 0;
+            }
         }
     }
 
-    // A RAM/VRAM-backed data disk (on the vdisk) exposed to Linux as /dev/vda.
-    // Lives in VM\ (created by disk_mgr_create; CreateDirectory here too in
-    // case this disk predates that, or was made by something else).
+    // A RAM/VRAM-backed data disk (on the vdisk) exposed to the VM as a second
+    // drive. Lives in VM\ (created by disk_mgr_create; CreateDirectory here
+    // too in case this disk predates that, or was made by something else).
+    // IDE for a custom image (unknown OS, may have no virtio drivers);
+    // virtio for our own Alpine, which we know supports it.
+    const char *disk_if = custom_image ? "ide" : "virtio";
     char vmdir[MAX_PATH], img[MAX_PATH];
     snprintf(vmdir, sizeof(vmdir), "%c:\\VM", L);
     CreateDirectoryA(vmdir, NULL);
@@ -345,9 +369,9 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share)
 
     // Give a tool install (or the bridge's cifs-utils) some headroom over the
     // bare-shell default even without a recipe (we don't know an arbitrary
-    // package's footprint).
+    // package's footprint); a custom image's own requirements are unknown too.
     unsigned long long vm_ram_mb = recipe ? recipe->vm_ram_mb
-                                  : (tool_name || want_share) ? 1280 : DEFAULT_VM_RAM_MB;
+                                  : (tool_name || want_share || custom_image) ? 1280 : DEFAULT_VM_RAM_MB;
 
     // Repeated -accel flags are QEMU's documented fallback chain: it tries
     // whpx first and silently falls back to tcg if Windows Hypervisor
@@ -355,13 +379,27 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share)
     // proceeds normally either way) -- so this is always safe to pass, no
     // pre-check needed. 'vdisk accel enable' is what actually turns on whpx.
     char cmd[2048];
-    if (have_img) {
+    if (custom_image) {
+        // No -kernel/-initrd/-append here: an arbitrary ISO brings its own
+        // bootloader (SeaBIOS -> ISOLINUX/GRUB/whatever), which -nographic
+        // relays to this console just like it does Alpine's.
+        if (have_img) {
+            snprintf(cmd, sizeof(cmd),
+                     "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
+                     "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=%s",
+                     q, vm_ram_mb, iso, img, disk_if);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic -cdrom \"%s\"",
+                     q, vm_ram_mb, iso);
+        }
+    } else if (have_img) {
         snprintf(cmd, sizeof(cmd),
                  "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
                  "-kernel \"%s\" -initrd \"%s\" "
                  "-append \"console=ttyS0 modloop=/boot/modloop-virt quiet\" "
-                 "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
-                 q, vm_ram_mb, kernel, initrd, iso, img);
+                 "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=%s",
+                 q, vm_ram_mb, kernel, initrd, iso, img, disk_if);
     } else {
         snprintf(cmd, sizeof(cmd),
                  "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
@@ -373,7 +411,11 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share)
 
     printf("\n");
     printf("=====================================================================\n");
-    printf(" vdisk linux -s %c  --  REAL Alpine Linux in QEMU (headless console)\n", L);
+    if (custom_image) {
+        printf(" vdisk linux -s %c -image  --  %s (headless console)\n", L, iso);
+    } else {
+        printf(" vdisk linux -s %c  --  REAL Alpine Linux in QEMU (headless console)\n", L);
+    }
     if (tool_name) {
         printf(" Auto-installing: %s%s (this can take a few minutes under software emulation)\n",
                tool_name, tools_net ? " (from the network)" : " (from the local boot image only)");
@@ -383,7 +425,10 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share)
         bridge_folder_path(bridgepath, sizeof(bridgepath));
         printf(" Bridging %s into the VM at /mnt/win (share '%s').\n", bridgepath, share_name);
     }
-    if (!tool_name && !want_share) {
+    if (custom_image) {
+        printf(" Unknown OS: follow its own boot menu/login on screen.%s\n",
+               have_img ? "  Extra data disk attached." : "");
+    } else if (!tool_name && !want_share) {
         printf(" Login: root  (no password).%s\n", have_img ? "  Disk is /dev/vda inside Linux." : "");
     }
     printf(" To leave: type 'poweroff'  (or press Ctrl-A then X to kill QEMU).\n");
