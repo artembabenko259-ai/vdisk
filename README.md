@@ -18,7 +18,7 @@ so **no Administrator privileges are required** to mount or unmount them.
 - **Persistent While Mounted**: Each disk is served by a lightweight background worker process that lives until the disk is removed.
 - **Portable**: Locates WinFsp via the registry and stores its state in `%LOCALAPPDATA%\vdisk`; runs from any folder.
 - **Real Physical Disks**: `vdisk disk` attaches a RAM/VRAM-backed VHD via the native virtdisk API as a genuine `\\.\PhysicalDrive` — partitionable, testable, disposable — for safely exercising destructive disk tools.
-- **Real Linux VM**: `vdisk linux -s <DRIVE>` boots a real Alpine Linux kernel in QEMU, headless in your console, using the vdisk as storage (no admin, no reboot).
+- **Real Linux VM**: `vdisk linux -s <DRIVE>` boots a real Alpine Linux kernel in QEMU, headless in your console, using the vdisk as storage (no admin, no reboot). Add `--persist` to install it onto the disk so it survives across runs, or `--distro debian` for a real Debian instead.
 - **Comprehensive CLI**: `create`, `disk`, `remove`, `clear`, `list`, `status`, `mount`, `autostart`, `linux`, and `help`.
 
 ---
@@ -221,6 +221,48 @@ right in your Windows console (serial console, WSL2-style). Log in as `root`
 > Because it is software emulation (TCG), boot takes ~1–2 minutes and it runs
 > slowly. For near-native speed, enable "Windows Hypervisor Platform" (admin +
 > reboot) — QEMU then uses `whpx` acceleration.
+
+### Persistent Linux (`--persist`)
+
+By default `vdisk linux -s` is fully diskless: every run boots a fresh Alpine
+into RAM, and anything you `apk add` or write outside the attached data disk
+is gone the moment you `poweroff`. `--persist` installs a small real system
+**onto** the vdisk's data disk instead, so it survives across separate runs:
+
+```cmd
+vdisk create ram 2G D:
+vdisk linux -s D --persist
+```
+
+- **First run**: formats the data disk and installs Alpine onto it directly
+  (no bootloader needed — `vdisk` always supplies the kernel itself). Fully
+  offline, using only the local repo carried on the boot image — no network
+  needed. Takes ~30–90 seconds, then hands you the shell.
+- **Every run after that**: boots straight off the installed disk. Packages
+  you `apk add`, files you create, anything under `/` — all still there,
+  right up until you `vdisk remove D:` and the underlying RAM/VRAM disk (and
+  everything on it) is wiped.
+- Always leave with `poweroff`, not `Ctrl-A X`: a clean poweroff flushes
+  writes to the disk first. Killing the VM can lose the last few seconds of
+  unsynced writes — the same as unplugging a real machine mid-write.
+- Not compatible with `--tools`/`--tools-net`/`--share`/`-image` (v1 scope) —
+  those assume the plain diskless Alpine flow.
+
+### A different distro (`--distro`)
+
+```cmd
+vdisk linux -s D --distro debian --persist
+:: --distro debian implies --persist -- an installed distro only makes sense
+:: as a persistent disk, there's no "diskless" mode for it like Alpine's
+```
+
+- **`alpine`** (default) — the offline-capable path described above.
+- **`debian`** — debootstraps a real Debian 12 ("bookworm") onto the disk
+  instead, booted via the exact same Alpine-provided kernel (the kernel
+  doesn't care whose userland it hands off to). **Needs network** for the
+  one-time install (~3–8 minutes, downloading Debian's package mirror);
+  every run after that is offline and boots straight from the disk, same as
+  Alpine's `--persist`.
 
 ---
 

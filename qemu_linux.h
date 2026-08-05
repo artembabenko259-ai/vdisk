@@ -36,8 +36,28 @@
 // the first two; a plain interactive console for the third); with none of
 // them, you get a plain, directly-interactive Alpine shell.
 //
+// 'persist' installs a real (small) Alpine system onto the vdisk's data disk
+// instead of just handing the VM a blank /dev/vda: the FIRST run formats it,
+// installs alpine-base onto it (automated, local boot-image repo only, no
+// network needed, ~30-60s), and every run after that boots straight from that
+// disk -- so apk-installed packages and any files under / survive across
+// separate 'vdisk linux -s <DRIVE> --persist' invocations, until the disk
+// itself is removed ('vdisk remove <DRIVE>'). Mutually exclusive with
+// 'tool_name'/'want_share'/'image_path' (v1 scope). Exit with 'poweroff' for
+// a clean sync; killing the VM (Ctrl-A X) can lose the last unsynced writes,
+// same as real hardware losing power.
+//
+// 'distro' selects what --persist installs: NULL or "alpine" (default) for
+// the Alpine path above, or "debian" to debootstrap a real Debian (bookworm)
+// userland onto the same disk instead (needs network for the one-time
+// install; boots via the SAME Alpine kernel+initramfs either way -- the
+// kernel doesn't care whose userland it switch_roots into). Passing "debian"
+// implies persist=1 regardless of the 'persist' argument, since an installed
+// distro other than Alpine only makes sense as a persistent disk.
+//
 // Returns 1 on success, 0 on failure to launch or provision.
 int qemu_run_linux(char drive_letter, const char *tool_name, int tools_net,
-                    int want_share, const char *image_path);
+                    int want_share, const char *image_path, int persist,
+                    const char *distro);
 
 #endif // QEMU_LINUX_H

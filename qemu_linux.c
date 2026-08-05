@@ -17,11 +17,34 @@
 #define ALPINE_REPO_MAIN      "https://dl-cdn.alpinelinux.org/alpine/v3.20/main"
 #define ALPINE_REPO_COMMUNITY "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 
+#define DEBIAN_APT_REPO "http://deb.debian.org/debian"
+
 #define DATA_IMG_MB 512
+#define PERSIST_IMG_MB 2048
 #define DEFAULT_VM_RAM_MB 1024
 
 static int file_exists(const char *p) {
     return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Whole-disk ext4 (no partition table -- we boot it directly via
+// root=/dev/vda, no bootloader involved), so detecting "already installed"
+// is just: does the ext4 superblock magic (0xEF53, little-endian, at byte
+// offset 1080 -- 1024-byte boot area + 56-byte offset into the superblock)
+// show up where mkfs.ext4 would have put it.
+static int img_has_ext4(const char *path) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER off; off.QuadPart = 1080;
+    unsigned char magic[2] = {0, 0};
+    DWORD read = 0;
+    int ok = 0;
+    if (SetFilePointerEx(h, off, NULL, FILE_BEGIN) &&
+        ReadFile(h, magic, sizeof(magic), &read, NULL) && read == sizeof(magic)) {
+        ok = (magic[0] == 0x53 && magic[1] == 0xEF);
+    }
+    CloseHandle(h);
+    return ok;
 }
 
 // Locate qemu-system-x86_64.exe: default install dir, then PATH.
@@ -252,9 +275,336 @@ static int outbuf_last_int_after(outbuf_t *buf, const char *needle) {
 }
 
 // ---------------------------------------------------------------------------
+// --persist: installs a small real Alpine system onto the vdisk's data disk
+// (whole-disk ext4, no partition table -- we always supply the kernel/initrd
+// ourselves via QEMU args, so no bootloader is needed) and boots straight
+// from it afterward, instead of the normal diskless tmpfs-only root. Uses
+// ONLY the local boot-image apk repo (/media/cdrom/apks) -- no network
+// needed for the install itself.
+//
+// Empirically verified sequence (this exact set of steps, in this order):
+//   1. apk update; apk add --no-cache e2fsprogs           (on the LIVE/diskless side)
+//   2. modprobe ext4; mkfs.ext4 -F -q /dev/vda; mount -t ext4 /dev/vda /mnt
+//   3. apk add --repository /media/cdrom/apks --root /mnt --initdb
+//        --allow-untrusted alpine-base e2fsprogs           (installs INTO /mnt)
+//   4. uncomment the ttyS0 getty line in /mnt/etc/inittab (serial console login)
+//   5. add "/dev/vda / ext4 rw,relatime 0 1" to /mnt/etc/fstab
+//   6. symlink the boot-critical services into /mnt/etc/runlevels/{sysinit,boot,default}:
+//        sysinit: devfs dmesg hwdrivers mdev
+//        boot:    sysctl hostname bootmisc syslog hwclock fsck root localmount mtab swap
+//        default: local
+//      Root's password is already empty in a fresh alpine-base install
+//      (shadow entry "root:::0:::::") -- no separate step needed for that.
+//      Skipping 'modules' on purpose: there's no /lib/modules on this minimal
+//      root (no linux-virt package), so the modules service just warns
+//      harmlessly every boot; the virtio drivers we need are already built
+//      into vmlinuz-virt.
+//      Without step 6's "fsck"/"root"/"localmount" specifically, root stays
+//      mounted read-only forever (confirmed: that's what actually remounts
+//      it read-write at boot -- the diskless boot's own tmpfs-overlay flow
+//      does this as a hardcoded initramfs step that a real root= disk boot
+//      does NOT get for free; it must come from enabled OpenRC services like
+//      any normal disk-installed system).
+//   7. point /mnt/etc/apk/repositories at the same local repo (so `apk add`
+//      still works after switching to the persisted disk, as long as the ISO
+//      stays attached)
+//   8. sync; umount /mnt; poweroff (clean shutdown so the writes are flushed --
+//      killing the VM instead can lose the last unsynced writes, like a real
+//      power loss)
+//
+// Returns 1 if the disk now has an installed system (whether it just got
+// installed or already had one), 0 on failure.
+static int persist_install_if_needed(const char *qemu_bin, const char *kernel, const char *initrd,
+                                      const char *iso, const char *img, unsigned long long vm_ram_mb) {
+    if (img_has_ext4(img)) return 1; // already installed, nothing to do
+
+    printf("[vdisk] First run with --persist: installing a small persistent Alpine onto the disk\n");
+    printf("        (one-time, local repo only, no network needed, ~30-90s)...\n");
+    fflush(stdout);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
+             "-kernel \"%s\" -initrd \"%s\" "
+             "-append \"console=ttyS0 modloop=/boot/modloop-virt quiet\" "
+             "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
+             qemu_bin, vm_ram_mb, kernel, initrd, iso, img);
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hChildStdinR, hChildStdinW, hChildStdoutR, hChildStdoutW;
+    if (!CreatePipe(&hChildStdinR, &hChildStdinW, &sa, 0) ||
+        !CreatePipe(&hChildStdoutR, &hChildStdoutW, &sa, 0)) {
+        printf("[vdisk] Failed to create pipes (error %lu).\n", GetLastError());
+        return 0;
+    }
+    SetHandleInformation(hChildStdinW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hChildStdoutR, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hChildStdinR;
+    si.hStdOutput = hChildStdoutW;
+    si.hStdError = hChildStdoutW;
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
+        CloseHandle(hChildStdinR); CloseHandle(hChildStdinW);
+        CloseHandle(hChildStdoutR); CloseHandle(hChildStdoutW);
+        return 0;
+    }
+    CloseHandle(hChildStdinR);
+    CloseHandle(hChildStdoutW);
+
+    outbuf_t buf;
+    outbuf_init(&buf);
+    out_relay_ctx_t octx = { hChildStdoutR, GetStdHandle(STD_OUTPUT_HANDLE), &buf };
+    HANDLE hOutThread = CreateThread(NULL, 0, out_relay_thread, &octx, 0, NULL);
+
+    int ok = 0;
+    if (!wait_for_nth(&buf, "login:", 1, 360000, pi.hProcess)) {
+        printf("\n[vdisk] Did not reach the login prompt in time; aborting.\n");
+        TerminateProcess(pi.hProcess, 1);
+        goto cleanup;
+    }
+    pipe_send(hChildStdinW, "root\n");
+    wait_for_nth(&buf, "You may change this message by editing /etc/motd.", 1, 20000, pi.hProcess);
+    Sleep(500);
+
+    {
+        const char *marker = "/tmp/vdisk_persist_install_ok";
+        char provcmd[2048];
+        snprintf(provcmd, sizeof(provcmd),
+            "( apk update >/tmp/vdisk-persist.log 2>&1 && "
+            "apk add --no-cache e2fsprogs >>/tmp/vdisk-persist.log 2>&1 && "
+            "modprobe ext4 >>/tmp/vdisk-persist.log 2>&1; "
+            "mkfs.ext4 -F -q /dev/vda >>/tmp/vdisk-persist.log 2>&1 && "
+            "mount -t ext4 /dev/vda /mnt >>/tmp/vdisk-persist.log 2>&1 && "
+            "apk add --repository /media/cdrom/apks --root /mnt --initdb --allow-untrusted "
+            "alpine-base e2fsprogs >>/tmp/vdisk-persist.log 2>&1 && "
+            "sed -i 's/^#ttyS0/ttyS0/' /mnt/etc/inittab && "
+            "echo '/dev/vda / ext4 rw,relatime 0 1' >> /mnt/etc/fstab && "
+            "echo /media/cdrom/apks > /mnt/etc/apk/repositories && "
+            "mkdir -p /mnt/etc/runlevels/sysinit /mnt/etc/runlevels/boot /mnt/etc/runlevels/default && "
+            "for s in devfs dmesg hwdrivers mdev; do ln -sf /etc/init.d/$s /mnt/etc/runlevels/sysinit/$s; done && "
+            "for s in sysctl hostname bootmisc syslog hwclock fsck root localmount mtab swap; do "
+            "ln -sf /etc/init.d/$s /mnt/etc/runlevels/boot/$s; done && "
+            "ln -sf /etc/init.d/local /mnt/etc/runlevels/default/local && "
+            "sync && umount /mnt && echo $? >%s ) >/tmp/vdisk-persist-outer.log 2>&1 &\n",
+            marker);
+        pipe_send(hChildStdinW, provcmd);
+        Sleep(1000);
+
+        int prov_ok = 0;
+        DWORD deadline = GetTickCount() + 180000; // local-repo-only install; generous but bounded
+        while (GetTickCount() < deadline) {
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+            char probe[128], hit[48];
+            snprintf(hit, sizeof(hit), "VDISK_PREADY_%lu", GetTickCount());
+            snprintf(probe, sizeof(probe), "test -f %s && echo %s\n", marker, hit);
+            pipe_send(hChildStdinW, probe);
+            if (wait_for_nth(&buf, hit, 2, 8000, pi.hProcess)) { prov_ok = 1; break; }
+            Sleep(3000);
+        }
+
+        if (!prov_ok) {
+            printf("\n[vdisk] Install did not confirm completion in time; aborting.\n");
+            printf("[vdisk] (check /tmp/vdisk-persist*.log inside a plain 'vdisk linux -s' shell)\n");
+            TerminateProcess(pi.hProcess, 1);
+            goto cleanup;
+        }
+
+        pipe_send(hChildStdinW, "poweroff\n");
+        WaitForSingleObject(pi.hProcess, 30000); // clean ACPI shutdown; belt-and-suspenders below
+        if (WaitForSingleObject(pi.hProcess, 0) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 0);
+    }
+    ok = 1;
+
+cleanup:
+    WaitForSingleObject(hOutThread, 2000);
+    CloseHandle(hChildStdoutR);
+    CloseHandle(hChildStdinW);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    outbuf_free(&buf);
+
+    if (ok && img_has_ext4(img)) {
+        printf("[vdisk] Install complete.\n\n");
+        return 1;
+    }
+    printf("[vdisk] Install did not take (disk still has no ext4 filesystem).\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// --distro debian: same idea as persist_install_if_needed above (install once
+// onto /dev/vda, boot straight from it after), but instead of a local apk
+// install it debootstraps a real Debian (bookworm) userland -- using OUR OWN
+// Alpine kernel+initramfs to do it (the kernel doesn't care whose userland it
+// switch_roots into; Debian's own kernel package is never involved). Needs
+// network (Debian's package mirror), unlike the Alpine path.
+//
+// Empirically verified sequence:
+//   1. ip link set eth0 up; udhcpc -i eth0 -q -n
+//   2. apk add the network main+community repos; apk update; apk add
+//        debootstrap e2fsprogs                        (debootstrap runs ON Alpine,
+//                                                        targeting Debian -- this
+//                                                        is its designed use case)
+//   3. mkfs.ext4 /dev/vda; mount /mnt
+//   4. debootstrap --include=sysvinit-core,sysvinit-utils,net-tools
+//        --variant=minbase bookworm /mnt http://deb.debian.org/debian
+//      (sysvinit, not systemd -- lighter, and doesn't fight our non-systemd
+//      direct-kernel-boot the way systemd's cgroup/mount expectations might;
+//      confirmed: debootstrap's own package postinst scripts already register
+//      checkroot.sh/mountall.sh/etc. under /mnt/etc/rcS.d on their own --
+//      unlike Alpine's apk install, NO manual rc-update-equivalent step
+//      is needed here)
+//   5. uncomment the ttyS0 getty line in /mnt/etc/inittab (Debian's default
+//      inittab has it commented as "#T0:23:respawn:/sbin/getty -L ttyS0 9600 vt100")
+//   6. clear root's password in /mnt/etc/shadow (debootstrap leaves it as
+//      "*" -- LOCKED, not merely empty like Alpine's fresh install -- so this
+//      step is required here, unlike the Alpine path where it's already empty)
+//   7. write a real /mnt/etc/fstab (debootstrap leaves a placeholder comment)
+//      and a minimal /mnt/etc/apt/sources.list so apt works after switching
+//   8. sync; umount /mnt; poweroff
+static int debian_install_if_needed(const char *qemu_bin, const char *kernel, const char *initrd,
+                                     const char *iso, const char *img, unsigned long long vm_ram_mb) {
+    if (img_has_ext4(img)) return 1;
+
+    printf("[vdisk] First run with --distro debian: debootstrapping a real Debian\n");
+    printf("        onto the disk (one-time, needs network, ~3-8 min)...\n");
+    fflush(stdout);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
+             "-kernel \"%s\" -initrd \"%s\" "
+             "-append \"console=ttyS0 modloop=/boot/modloop-virt quiet\" "
+             "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
+             qemu_bin, vm_ram_mb, kernel, initrd, iso, img);
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hChildStdinR, hChildStdinW, hChildStdoutR, hChildStdoutW;
+    if (!CreatePipe(&hChildStdinR, &hChildStdinW, &sa, 0) ||
+        !CreatePipe(&hChildStdoutR, &hChildStdoutW, &sa, 0)) {
+        printf("[vdisk] Failed to create pipes (error %lu).\n", GetLastError());
+        return 0;
+    }
+    SetHandleInformation(hChildStdinW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hChildStdoutR, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hChildStdinR;
+    si.hStdOutput = hChildStdoutW;
+    si.hStdError = hChildStdoutW;
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
+        CloseHandle(hChildStdinR); CloseHandle(hChildStdinW);
+        CloseHandle(hChildStdoutR); CloseHandle(hChildStdoutW);
+        return 0;
+    }
+    CloseHandle(hChildStdinR);
+    CloseHandle(hChildStdoutW);
+
+    outbuf_t buf;
+    outbuf_init(&buf);
+    out_relay_ctx_t octx = { hChildStdoutR, GetStdHandle(STD_OUTPUT_HANDLE), &buf };
+    HANDLE hOutThread = CreateThread(NULL, 0, out_relay_thread, &octx, 0, NULL);
+
+    int ok = 0;
+    if (!wait_for_nth(&buf, "login:", 1, 360000, pi.hProcess)) {
+        printf("\n[vdisk] Did not reach the login prompt in time; aborting.\n");
+        TerminateProcess(pi.hProcess, 1);
+        goto cleanup;
+    }
+    pipe_send(hChildStdinW, "root\n");
+    wait_for_nth(&buf, "You may change this message by editing /etc/motd.", 1, 20000, pi.hProcess);
+    Sleep(500);
+
+    {
+        const char *marker = "/tmp/vdisk_debian_install_ok";
+        char provcmd[3072];
+        snprintf(provcmd, sizeof(provcmd),
+            "( ip link set eth0 up && udhcpc -i eth0 -q -n >/tmp/vdisk-debian.log 2>&1 && "
+            "echo %s >> /etc/apk/repositories && "
+            "echo %s >> /etc/apk/repositories && "
+            "apk update >>/tmp/vdisk-debian.log 2>&1 && "
+            "apk add --no-cache debootstrap e2fsprogs >>/tmp/vdisk-debian.log 2>&1 && "
+            "modprobe ext4 >>/tmp/vdisk-debian.log 2>&1; "
+            "mkfs.ext4 -F -q /dev/vda >>/tmp/vdisk-debian.log 2>&1 && "
+            "mount -t ext4 /dev/vda /mnt >>/tmp/vdisk-debian.log 2>&1 && "
+            "debootstrap --include=sysvinit-core,sysvinit-utils,net-tools --variant=minbase "
+            "bookworm /mnt %s >>/tmp/vdisk-debian.log 2>&1 && "
+            "sed -i 's/^#T0:23:respawn/T0:2345:respawn/' /mnt/etc/inittab && "
+            "sed -i 's/^root:\\*:/root::/' /mnt/etc/shadow && "
+            "printf '/dev/vda / ext4 rw,relatime 0 1\\nproc /proc proc defaults 0 0\\n' > /mnt/etc/fstab && "
+            "echo 'deb %s bookworm main' > /mnt/etc/apt/sources.list "
+            // debootstrap can leave something (gpg-agent et al.) with an open
+            // fd inside /mnt, so a plain umount can EBUSY here even though the
+            // install itself fully succeeded (confirmed empirically) -- sync
+            // first regardless, then fall back to a lazy unmount so the
+            // marker always gets written; img_has_ext4() is the real
+            // success check afterward, not this exit code.
+            "; sync; umount /mnt || umount -l /mnt; echo $? >%s ) >/tmp/vdisk-debian-outer.log 2>&1 &\n",
+            ALPINE_REPO_MAIN, ALPINE_REPO_COMMUNITY, DEBIAN_APT_REPO, DEBIAN_APT_REPO, marker);
+        pipe_send(hChildStdinW, provcmd);
+        Sleep(1000);
+
+        int prov_ok = 0;
+        DWORD deadline = GetTickCount() + 900000; // debootstrap over emulated network: budget generously
+        while (GetTickCount() < deadline) {
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+            char probe[128], hit[48];
+            snprintf(hit, sizeof(hit), "VDISK_DREADY_%lu", GetTickCount());
+            snprintf(probe, sizeof(probe), "test -f %s && echo %s\n", marker, hit);
+            pipe_send(hChildStdinW, probe);
+            if (wait_for_nth(&buf, hit, 2, 8000, pi.hProcess)) { prov_ok = 1; break; }
+            Sleep(5000);
+        }
+
+        if (!prov_ok) {
+            printf("\n[vdisk] Install did not confirm completion in time; aborting.\n");
+            printf("[vdisk] (check /tmp/vdisk-debian*.log inside a plain 'vdisk linux -s' shell)\n");
+            TerminateProcess(pi.hProcess, 1);
+            goto cleanup;
+        }
+
+        pipe_send(hChildStdinW, "poweroff\n");
+        WaitForSingleObject(pi.hProcess, 30000);
+        if (WaitForSingleObject(pi.hProcess, 0) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 0);
+    }
+    ok = 1;
+
+cleanup:
+    WaitForSingleObject(hOutThread, 2000);
+    CloseHandle(hChildStdoutR);
+    CloseHandle(hChildStdinW);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    outbuf_free(&buf);
+
+    if (ok && img_has_ext4(img)) {
+        printf("[vdisk] Install complete.\n\n");
+        return 1;
+    }
+    printf("[vdisk] Install did not take (disk still has no ext4 filesystem).\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 
 int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
-                    const char *image_path) {
+                    const char *image_path, int persist, const char *distro) {
+    int is_debian = (distro && _stricmp(distro, "debian") == 0);
+    if (distro && !is_debian && _stricmp(distro, "alpine") != 0) {
+        printf("[vdisk] Unknown --distro '%s'. Supported: alpine (default), debian.\n", distro);
+        return 0;
+    }
+    // A distro other than Alpine only makes sense as an installed, persistent
+    // system -- there's no "diskless" boot flow for it the way Alpine's
+    // ISO-based live mode works.
+    if (is_debian) persist = 1;
     L = (char)toupper((unsigned char)L);
     if (L < 'A' || L > 'Z') {
         printf("[vdisk] Specify a drive: 'vdisk linux -s <DRIVE>' (mount it first with 'vdisk create ram 2G <DRIVE>').\n");
@@ -273,6 +623,14 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
     }
     if (image_path && !file_exists(image_path)) {
         printf("[vdisk] Image not found: %s\n", image_path);
+        return 0;
+    }
+    // --persist installs its own known Alpine system onto /dev/vda and boots
+    // straight from it; that's a different (and incompatible) code path from
+    // the tools/share/image automation, which all assume the normal diskless
+    // tmpfs root instead.
+    if (persist && (tool_name || want_share || image_path)) {
+        printf("[vdisk] --persist can't be combined with --tools/--tools-net/--share/-image.\n");
         return 0;
     }
 
@@ -352,12 +710,21 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
     CreateDirectoryA(vmdir, NULL);
     snprintf(img, sizeof(img), "%c:\\VM\\linux.img", L);
     int have_img = file_exists(img);
+    // A persisted image needs real room for an installed system + packages,
+    // not just a blank data disk -- and if a non-persist run already left a
+    // small blank one here, it's not a real install yet (img_has_ext4 below
+    // would say so anyway), so just start it over at the bigger size.
+    if (persist && have_img && !img_has_ext4(img)) {
+        DeleteFileA(img);
+        have_img = 0;
+    }
     if (!have_img) {
-        printf("[vdisk] Creating a %d MB data disk %c:\\VM\\linux.img ...\n", DATA_IMG_MB, L);
+        int img_mb = persist ? PERSIST_IMG_MB : DATA_IMG_MB;
+        printf("[vdisk] Creating a %d MB data disk %c:\\VM\\linux.img ...\n", img_mb, L);
         HANDLE hf = CreateFileA(img, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hf != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER sz;
-            sz.QuadPart = (LONGLONG)DATA_IMG_MB * 1024 * 1024;
+            sz.QuadPart = (LONGLONG)img_mb * 1024 * 1024;
             if (SetFilePointerEx(hf, sz, NULL, FILE_BEGIN) && SetEndOfFile(hf)) have_img = 1;
             CloseHandle(hf);
         }
@@ -365,6 +732,48 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
             DeleteFileA(img);
             printf("[vdisk] (Not enough room on %c: for a data disk; booting without one.)\n", L);
         }
+    }
+
+    if (persist) {
+        if (!have_img) {
+            printf("[vdisk] --persist needs room for a data disk on %c: (see above).\n", L);
+            return 0;
+        }
+        unsigned long long persist_ram_mb = is_debian ? 1024 : 768;
+        int installed = is_debian
+            ? debian_install_if_needed(q, kernel, initrd, iso, img, persist_ram_mb)
+            : persist_install_if_needed(q, kernel, initrd, iso, img, persist_ram_mb);
+        if (!installed) return 0;
+
+        char pcmd[2048];
+        snprintf(pcmd, sizeof(pcmd),
+                 "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
+                 "-kernel \"%s\" -initrd \"%s\" "
+                 "-append \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw quiet\" "
+                 "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
+                 q, persist_ram_mb, kernel, initrd, iso, img);
+
+        printf("\n");
+        printf("=====================================================================\n");
+        printf(" vdisk linux -s %c --persist  --  persistent %s in QEMU (headless console)\n",
+               L, is_debian ? "Debian" : "Alpine");
+        printf(" Login: root  (no password).  Files/packages survive until 'vdisk remove %c:'.\n", L);
+        printf(" To leave: type 'poweroff' (recommended -- flushes writes to disk).\n");
+        printf(" NOTE: software emulation (TCG) -- boot takes ~1-2 min and runs slowly.\n");
+        printf("=====================================================================\n\n");
+        fflush(stdout);
+
+        STARTUPINFOA psi = { sizeof(psi) };
+        PROCESS_INFORMATION ppi = {0};
+        if (!CreateProcessA(NULL, pcmd, NULL, NULL, TRUE, 0, NULL, NULL, &psi, &ppi)) {
+            printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
+            return 0;
+        }
+        WaitForSingleObject(ppi.hProcess, INFINITE);
+        CloseHandle(ppi.hProcess);
+        CloseHandle(ppi.hThread);
+        printf("\n[vdisk] Linux VM exited.\n");
+        return 1;
     }
 
     // Give a tool install (or the bridge's cifs-utils) some headroom over the

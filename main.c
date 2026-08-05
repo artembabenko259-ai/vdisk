@@ -92,44 +92,86 @@ static void print_help(void) {
     printf("\n");
     printf("=====================================================================\n");
     printf("     vdisk - Temporary RAM & VRAM Disk CLI Utility (WinFsp)\n");
+    printf("=====================================================================\n\n");
+
+    printf("-- DISKS (create/remove/list a RAM or VRAM drive letter) --------------\n");
+    printf("  vdisk create ram  <SIZE> [DRIVE] [-f FSNAME]  Create a RAM disk\n");
+    printf("  vdisk create vram <SIZE> [DRIVE] [-f FSNAME]  Create a GPU VRAM disk\n");
+    printf("  vdisk remove <DRIVE>                          Remove/unmount one disk\n");
+    printf("  vdisk clear                                   Remove ALL vdisk disks\n");
+    printf("  vdisk list                                    List active disks (drive, size, PID)\n");
+    printf("  vdisk status                                  Show free RAM / GPU VRAM available\n");
+    printf("    SIZE takes K/M/G suffixes (512M, 1G, 2048M). No DRIVE = next free letter\n");
+    printf("    from Z: down. -f sets the filesystem name Windows reports (default NTFS).\n");
+    printf("    Contents are ephemeral: gone on 'remove'/'clear' or reboot -- see 'save' below\n");
+    printf("    to keep data, or 'linux -s --persist' below for a disk that self-persists.\n\n");
+
+    printf("-- SAVE, AUTO-MOUNT & CONFIG -------------------------------------------\n");
+    printf("  vdisk save                                    Remember current disks for auto-mount\n");
+    printf("  vdisk save <DISK> \"<DEST>\" [ITEM ...]          Copy data OUT to a real folder now\n");
+    printf("  vdisk save <DISK> [\"<DEST>\"] --ev <time>       Repeat that copy on a loop (30sec/10min/hour/day)\n");
+    printf("  vdisk mount                                    (Re)create every disk listed in the config\n");
+    printf("  vdisk config                                   Show the config file path + contents\n");
+    printf("  vdisk autostart <on|off|status>                Run 'vdisk mount' automatically at login\n");
+    printf("    Typical setup: create your disks once, 'vdisk save' to remember them, then\n");
+    printf("    'vdisk autostart on' so they're back every login. 'save <DISK> <DEST>' is a\n");
+    printf("    ONE-OFF export (do it before 'remove'/shutdown); '--ev' automates that export\n");
+    printf("    on a timer while it keeps running -- neither makes the disk itself durable.\n\n");
+
+    printf("-- LINUX ON A DISK ------------------------------------------------------\n");
+    printf("  vdisk linux [DRIVE]                            Instant BusyBox shell (no VM, no kernel)\n");
+    printf("  vdisk linux -s <DRIVE>                          REAL Alpine kernel in QEMU (headless, WSL2-style)\n");
+    printf("  vdisk linux -s <DRIVE> --persist                 ...same, but installed ONTO the disk so it\n");
+    printf("                                                   survives separate runs (see below)\n");
+    printf("  vdisk linux -s <DRIVE> --distro debian --persist  ...install a real Debian instead of Alpine\n");
+    printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\"            ...auto-install one apk package (offline, from\n");
+    printf("                                                   the local boot image) before handing you the shell\n");
+    printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\" --tools-net  ...same, from the full network apk repos\n");
+    printf("  vdisk linux -s <DRIVE> --share                   Bridge a Windows folder into the VM at /mnt/win (SMB)\n");
+    printf("  vdisk linux -s <DRIVE> -image <path.iso>          Boot any ISO with its own bootloader instead\n");
+    printf("  vdisk linux --package [list|add <n>|del <n>|set-defaults]   Manage your apk favorites list\n");
+    printf("\n");
+    printf("  BusyBox ('linux' with no '-s') is instant but is only Unix tools (ls, vi, grep,\n");
+    printf("  ...) -- no real kernel, no apk, can't run Linux ELF binaries. For that you need\n");
+    printf("  '-s', a real Alpine kernel booted in QEMU (~1-2 min first boot under software\n");
+    printf("  emulation; run 'vdisk accel enable' once, as admin, for near-native speed).\n");
+    printf("\n");
+    printf("  Without --persist, '-s' is fully diskless every run: apk installs and any files\n");
+    printf("  outside the attached data disk vanish the moment you 'poweroff'. --persist\n");
+    printf("  installs a small real system straight onto the vdisk's data disk instead (~30-90s,\n");
+    printf("  offline, the first time only); every run after that boots directly off that disk,\n");
+    printf("  so apk packages and files under / survive across separate invocations, right up\n");
+    printf("  until you 'vdisk remove <DRIVE>' and wipe the RAM/VRAM disk it lives on.\n");
+    printf("  --distro debian (implies --persist) debootstraps a real Debian 12 instead of\n");
+    printf("  Alpine onto that same disk -- needs network for that one-time install (~3-8 min);\n");
+    printf("  Alpine stays the default and is the only offline-capable option.\n");
+    printf("  Always exit with 'poweroff', not Ctrl-A X: a clean poweroff flushes writes to the\n");
+    printf("  disk, killing the VM can lose the last few seconds of unsynced writes -- same as\n");
+    printf("  unplugging a real machine. --persist is NOT compatible with --tools/--share/-image\n");
+    printf("  (those assume the plain diskless Alpine).\n\n");
+
+    printf("-- REAL PHYSICAL DISKS (for disk-management tools, diskpart, etc.) -----\n");
+    printf("  vdisk disk ram  <SIZE> [DRIVE]                 REAL \\\\.\\PhysicalDrive, RAM-backed (one step)\n");
+    printf("  vdisk disk vram <SIZE> [DRIVE]                 REAL \\\\.\\PhysicalDrive, VRAM-backed (one step)\n");
+    printf("  vdisk disk <DRIVE> <SIZE> [--format]           Attach one onto an EXISTING vdisk instead\n");
+    printf("  vdisk disk remove <DRIVE>                      Detach it (+ its backing, if it was one-step)\n");
+    printf("  vdisk disk list                                 List attached physical block disks\n");
+    printf("    A plain vdisk is a filesystem (drive letter); this is a genuine raw block device\n");
+    printf("    (visible in Disk Management/'diskpart list disk') for exercising partitioning or\n");
+    printf("    destructive disk tools safely. Requires Administrator (self-elevates).\n\n");
+
+    printf("-- HARDWARE VM ACCELERATION ---------------------------------------------\n");
+    printf("  vdisk accel [status]                           Check Windows Hypervisor Platform (no admin)\n");
+    printf("  vdisk accel enable                             Turn it on (Administrator + one-time reboot)\n");
+    printf("    Speeds up every 'linux -s' VM from ~1-2 min software-emulated boots to near-native.\n\n");
+
+    printf("  vdisk help                                     Display this help menu\n");
     printf("=====================================================================\n");
-    printf("COMMANDS:\n");
-    printf("  vdisk create ram  <SIZE> [DRIVE] [-f FSNAME]  Create RAM disk\n");
-    printf("  vdisk create vram <SIZE> [DRIVE] [-f FSNAME]  Create GPU VRAM disk\n");
-    printf("  vdisk remove <DRIVE>                          Remove one disk\n");
-    printf("  vdisk clear                                   Remove ALL disks\n");
-    printf("  vdisk list                                    List active disks\n");
-    printf("  vdisk status                                  Show RAM/VRAM hardware info\n");
-    printf("  vdisk save                                    Remember active disks for auto-mount\n");
-    printf("  vdisk save <DISK> \"<DEST>\" [ITEM ...]          Copy data OUT of a disk (persist before wipe)\n");
-    printf("  vdisk save <DISK> [\"<DEST>\"] --ev <time>       Auto-save on a loop (30sec, 10min, hour, day, ...)\n");
-    printf("  vdisk mount                                   Mount every disk in config\n");
-    printf("  vdisk config                                  Show the config file\n");
-    printf("  vdisk autostart <on|off|status>               Auto-mount at login\n");
-    printf("  vdisk linux [DRIVE]                           Instant BusyBox Unix shell on a disk\n");
-    printf("  vdisk linux -s <DRIVE>                        REAL Alpine Linux in QEMU (headless console)\n");
-    printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\"          ...and auto-install any apk package (local boot image)\n");
-    printf("  vdisk linux -s <DRIVE> --tools \"<pkg>\" --tools-net\n");
-    printf("                                                 ...same, but from the full network apk repos\n");
-    printf("  vdisk linux -s <DRIVE> --share                Bridge a Windows folder into the VM at /mnt/win (SMB)\n");
-    printf("  vdisk linux -s <DRIVE> -image <path>          Boot any ISO (own bootloader), not just Alpine\n");
-    printf("  vdisk linux --package [list]                  Show your saved package favorites (empty by default)\n");
-    printf("  vdisk linux --package add <name>              Save a package name to the list\n");
-    printf("  vdisk linux --package del <name>              Remove it from the list\n");
-    printf("  vdisk linux --package set-defaults             Load a small starter set (git, curl, htop, ...)\n");
-    printf("  vdisk disk ram  <SIZE> [DRIVE]                REAL physical disk, RAM-backed (one step)\n");
-    printf("  vdisk disk vram <SIZE> [DRIVE]                REAL physical disk, VRAM-backed (one step)\n");
-    printf("  vdisk disk <DRIVE> <SIZE> [--format]          REAL physical disk on an existing vdisk\n");
-    printf("  vdisk disk remove <DRIVE>                     Detach it (and its backing if RAM/VRAM one-step)\n");
-    printf("  vdisk disk list                               List physical block disks\n");
-    printf("  vdisk accel [status]                          Check hardware VM acceleration (no admin)\n");
-    printf("  vdisk accel enable                            Turn it on (needs admin + a one-time reboot)\n");
-    printf("  vdisk help                                    Display this help menu\n\n");
     printf("EXAMPLES:\n");
-    printf("  vdisk create ram 512M R:            512 MB RAM disk on R:\n");
-    printf("  vdisk create vram 1G V: -f FAT32    1 GB VRAM disk on V: reported as FAT32\n");
-    printf("  vdisk save                          Remember current disks...\n");
-    printf("  vdisk autostart on                  ...and mount them automatically at login\n");
+    printf("  vdisk create ram 512M R:                       512 MB RAM disk on R:\n");
+    printf("  vdisk save && vdisk autostart on                Remember disks, remount them every login\n");
+    printf("  vdisk create ram 2G D: && vdisk linux -s D: --persist\n");
+    printf("                                                  A real Linux that keeps its state around\n");
     printf("=====================================================================\n\n");
 }
 
@@ -277,8 +319,10 @@ int main(int argc, char *argv[]) {
             char drive = 0;
             const char *tool = NULL;
             const char *image = NULL;
+            const char *distro = NULL;
             int tools_net = 0;
             int want_share = 0;
+            int persist = 0;
             for (int i = 3; i < argc; i++) {
                 if (_stricmp(argv[i], "--tools") == 0 && i + 1 < argc) {
                     tool = argv[++i];
@@ -288,6 +332,10 @@ int main(int argc, char *argv[]) {
                     want_share = 1;
                 } else if (_stricmp(argv[i], "-image") == 0 && i + 1 < argc) {
                     image = argv[++i];
+                } else if (_stricmp(argv[i], "--persist") == 0) {
+                    persist = 1;
+                } else if (_stricmp(argv[i], "--distro") == 0 && i + 1 < argc) {
+                    distro = argv[++i];
                 } else if (!drive) {
                     drive = argv[i][0];
                 }
@@ -297,6 +345,10 @@ int main(int argc, char *argv[]) {
                        "(those assume the built-in Alpine image).\n");
                 return 1;
             }
+            if (persist && (tool || want_share || image)) {
+                printf("[vdisk] --persist can't be combined with --tools/--tools-net/--share/-image.\n");
+                return 1;
+            }
             // --share needs Administrator for ONE step (creating the SMB
             // share) -- but elevating this WHOLE process would make it lose
             // sight of the vdisk (RAM disk letters are only visible in the
@@ -304,7 +356,7 @@ int main(int argc, char *argv[]) {
             // user). So we deliberately stay unelevated here; bridge.c
             // elevates only that one narrow step, in a separate short-lived
             // process, then hands control straight back.
-            return qemu_run_linux(drive, tool, tools_net, want_share, image) ? 0 : 1;
+            return qemu_run_linux(drive, tool, tools_net, want_share, image, persist, distro) ? 0 : 1;
         }
         // vdisk linux [DRIVE]     -> instant BusyBox shell
         char drive = (argc >= 3) ? argv[2][0] : 0;
