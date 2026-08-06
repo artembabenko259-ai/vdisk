@@ -6,6 +6,7 @@
 #include <string.h>
 #include "disk_manager.h"
 #include "fs_memfs.h"
+#include "fs_nfsclient.h"
 #include "block_disk.h"
 #include "qemu_linux.h"
 #include "save_disk.h"
@@ -144,7 +145,21 @@ static void print_help(void) {
     printf("  until you 'vdisk remove <DRIVE>' and wipe the RAM/VRAM disk it lives on.\n");
     printf("  --distro debian (implies --persist) debootstraps a real Debian 12 instead of\n");
     printf("  Alpine onto that same disk -- needs network for that one-time install (~3-8 min);\n");
-    printf("  Alpine stays the default and is the only offline-capable option.\n");
+    printf("  Alpine stays the default and is the only offline-capable option.\n\n");
+    printf("  LIVE EXPLORER ACCESS (like \\\\wsl$\\): every '--persist' session also tries to\n");
+    printf("  pick a free drive letter and mount the VM's live '/' onto it for\n");
+    printf("  real, read/write access from Explorer/any Windows app while the VM is running --\n");
+    printf("  reliable on Alpine; on Debian it's best-effort and can fall back to a plain\n");
+    printf("  shell (see the warning note below).\n");
+    printf("  no extra flag needed. Look for 'X:\\ now mirrors this VM's / live' in the banner\n");
+    printf("  for which letter it picked. Under the hood: a tiny NFSv3 server is built with the\n");
+    printf("  guest's own gcc/apt-gcc the first time it's needed (cached after, on the same\n");
+    printf("  persisted disk) and the Windows side is a plain NFS network client (via WinFsp) --\n");
+    printf("  the guest's own ext4 driver stays the only thing that ever touches the disk\n");
+    printf("  bytes, so it's safe to use at the same time you're inside the VM's own shell.\n");
+    printf("  If it doesn't come up in time (needs outbound network the first time, for gcc/\n");
+    printf("  build-essential), you'll see a warning but the normal interactive shell still\n");
+    printf("  works -- check /tmp/vdisk-nfs*.log inside the VM for why.\n");
     printf("  Always exit with 'poweroff', not Ctrl-A X: a clean poweroff flushes writes to the\n");
     printf("  disk, killing the VM can lose the last few seconds of unsynced writes -- same as\n");
     printf("  unplugging a real machine. --persist is NOT compatible with --tools/--share/-image\n");
@@ -201,6 +216,21 @@ int main(int argc, char *argv[]) {
         const char *fs = (argc >= 6) ? argv[5] : "NTFS";
         if (size_mb == 0 || !drive) return 1;
         return fs_run(use_vram, size_mb, drive, fs);
+    }
+
+    // Internal: WinFsp worker that relays a Windows drive letter to a live
+    // NFSv3 export inside a running 'vdisk linux -s --persist' guest.
+    // Usage: vdisk --nfs-worker <HOST> <NFS_PORT> <MOUNT_PORT> <EXPORT_PATH> <DRIVE_LETTER> [FSNAME]
+    if (_stricmp(action, "--nfs-worker") == 0) {
+        if (argc < 7) return 1;
+        const char *host = argv[2];
+        unsigned short nfs_port = (unsigned short)atoi(argv[3]);
+        unsigned short mount_port = (unsigned short)atoi(argv[4]);
+        const char *export_path = argv[5];
+        char drive = argv[6][0];
+        const char *fs = (argc >= 8) ? argv[7] : "NTFS";
+        if (!nfs_port || !mount_port || !drive) return 1;
+        return fs_nfs_run(host, nfs_port, mount_port, export_path, drive, fs);
     }
 
     disk_mgr_init();

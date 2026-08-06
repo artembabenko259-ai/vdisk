@@ -450,7 +450,7 @@ cleanup:
 //                                                        targeting Debian -- this
 //                                                        is its designed use case)
 //   3. mkfs.ext4 /dev/vda; mount /mnt
-//   4. debootstrap --include=sysvinit-core,sysvinit-utils,net-tools
+//   4. debootstrap --include=sysvinit-core,sysvinit-utils,net-tools,iproute2
 //        --variant=minbase bookworm /mnt http://deb.debian.org/debian
 //      (sysvinit, not systemd -- lighter, and doesn't fight our non-systemd
 //      direct-kernel-boot the way systemd's cgroup/mount expectations might;
@@ -534,7 +534,7 @@ static int debian_install_if_needed(const char *qemu_bin, const char *kernel, co
             "modprobe ext4 >>/tmp/vdisk-debian.log 2>&1; "
             "mkfs.ext4 -F -q /dev/vda >>/tmp/vdisk-debian.log 2>&1 && "
             "mount -t ext4 /dev/vda /mnt >>/tmp/vdisk-debian.log 2>&1 && "
-            "debootstrap --include=sysvinit-core,sysvinit-utils,net-tools --variant=minbase "
+            "debootstrap --include=sysvinit-core,sysvinit-utils,net-tools,iproute2 --variant=minbase "
             "bookworm /mnt %s >>/tmp/vdisk-debian.log 2>&1 && "
             "sed -i 's/^#T0:23:respawn/T0:2345:respawn/' /mnt/etc/inittab && "
             "sed -i 's/^root:\\*:/root::/' /mnt/etc/shadow && "
@@ -590,6 +590,338 @@ cleanup:
     }
     printf("[vdisk] Install did not take (disk still has no ext4 filesystem).\n");
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Boots the persisted disk (root=/dev/vda, as always) but ALSO: adds an
+// explicit hostfwd-mapped network device, drives the console just long
+// enough (via the same pipe automation as --tools) to bring up eth0 and
+// start 'unfsd' (userspace NFSv3 server, apk-installed on first use and
+// cached thereafter -- confirmed empirically to work; the KERNEL nfsd
+// (rpc.nfsd) hangs the whole guest in this environment, do not use it)
+// exporting '/', then spawns a detached '--nfs-worker' process that mounts
+// that live export as a second Windows drive letter via WinFsp (fs_nfsclient.c)
+// -- real, live, read/write Explorer access to the SAME persisted root the
+// guest is booted from, safe because the guest's own ext4 driver stays the
+// only thing that ever touches the actual disk bytes; this is purely a
+// network client on the Windows side. Works for both Alpine (apk) and
+// Debian (apt) persisted installs -- the guest-side network/build automation
+// branches on which package manager is present.
+// Falls back to a warning (not a hard failure) if the automated setup
+// doesn't confirm in time; the user still gets their normal interactive
+// shell either way.
+static int run_persist_session(const char *qemu_bin, const char *kernel, const char *initrd,
+                                const char *iso, const char *img, unsigned long long vm_ram_mb,
+                                char L, int is_debian) {
+    unsigned short nfs_port = (unsigned short)(30000 + (unsigned char)(L - 'A'));
+    unsigned short mount_port = (unsigned short)(31000 + (unsigned char)(L - 'A'));
+    // Tracks the detached '--nfs-worker' child (if one gets spawned below) so
+    // it can be torn down once this VM session ends -- otherwise it keeps
+    // running forever after the guest server it talks to is gone, leaving a
+    // dead/phantom drive letter behind that Explorer still shows but that
+    // never responds to anything (confirmed empirically: reported by a user
+    // as "phantom disks remain, still laggy" after quitting a VM session).
+    DWORD nfs_worker_pid = 0;
+    char browse_drive = 0;
+    for (char c = 'Z'; c >= 'D'; c--) {
+        if (c == L) continue;
+        if (!(GetLogicalDrives() & (1u << (c - 'A')))) { browse_drive = c; break; }
+    }
+
+    char cmd[3072];
+    if (browse_drive) {
+        snprintf(cmd, sizeof(cmd),
+                 "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
+                 "-kernel \"%s\" -initrd \"%s\" "
+                 "-append \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw quiet\" "
+                 "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio "
+                 "-netdev user,id=n0,hostfwd=tcp:127.0.0.1:%u-:%u,hostfwd=tcp:127.0.0.1:%u-:%u "
+                 "-device virtio-net-pci,netdev=n0",
+                 qemu_bin, vm_ram_mb, kernel, initrd, iso, img,
+                 nfs_port, nfs_port, mount_port, mount_port);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
+                 "-kernel \"%s\" -initrd \"%s\" "
+                 "-append \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw modloop=/boot/modloop-virt quiet\" "
+                 "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
+                 qemu_bin, vm_ram_mb, kernel, initrd, iso, img);
+    }
+
+    printf("\n");
+    printf("=====================================================================\n");
+    printf(" vdisk linux -s %c --persist  --  persistent %s in QEMU (headless console)\n",
+           L, is_debian ? "Debian" : "Alpine");
+    printf(" Login: root  (no password).  Files/packages survive until 'vdisk remove %c:'.\n", L);
+    if (browse_drive)
+        printf(" Explorer access: %c:\\ will mirror this VM's / live (read/write) once it's up.\n", browse_drive);
+    printf(" To leave: type 'poweroff' (recommended -- flushes writes to disk).\n");
+    printf(" NOTE: software emulation (TCG) -- boot takes ~1-2 min and runs slowly.\n");
+    printf("=====================================================================\n\n");
+    fflush(stdout);
+
+    if (!browse_drive) {
+        // No free drive letter for the browse mount (or Debian, not wired up
+        // yet) -- just the plain interactive boot, console inherited directly.
+        STARTUPINFOA psi = { sizeof(psi) };
+        PROCESS_INFORMATION ppi = {0};
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &psi, &ppi)) {
+            printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
+            return 0;
+        }
+        WaitForSingleObject(ppi.hProcess, INFINITE);
+        CloseHandle(ppi.hProcess);
+        CloseHandle(ppi.hThread);
+        printf("\n[vdisk] Linux VM exited.\n");
+        return 1;
+    }
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hChildStdinR, hChildStdinW, hChildStdoutR, hChildStdoutW;
+    if (!CreatePipe(&hChildStdinR, &hChildStdinW, &sa, 0) ||
+        !CreatePipe(&hChildStdoutR, &hChildStdoutW, &sa, 0)) {
+        printf("[vdisk] Failed to create pipes (error %lu).\n", GetLastError());
+        return 0;
+    }
+    SetHandleInformation(hChildStdinW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hChildStdoutR, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hChildStdinR;
+    si.hStdOutput = hChildStdoutW;
+    si.hStdError = hChildStdoutW;
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
+        CloseHandle(hChildStdinR); CloseHandle(hChildStdinW);
+        CloseHandle(hChildStdoutR); CloseHandle(hChildStdoutW);
+        return 0;
+    }
+    CloseHandle(hChildStdinR);
+    CloseHandle(hChildStdoutW);
+
+    outbuf_t buf;
+    outbuf_init(&buf);
+    out_relay_ctx_t octx = { hChildStdoutR, GetStdHandle(STD_OUTPUT_HANDLE), &buf };
+    HANDLE hOutThread = CreateThread(NULL, 0, out_relay_thread, &octx, 0, NULL);
+
+    if (wait_for_nth(&buf, "login:", 1, 180000, pi.hProcess)) {
+        pipe_send(hChildStdinW, "root\n");
+        Sleep(2000); // generous: motd text differs between a fresh vs. package-updated system
+
+        // Debian's root shell is bash, which enables full GNU readline on a
+        // real tty (the QEMU serial console counts as one) -- readline's
+        // input redraw logic can't keep up with pipe_send()'s fast character-
+        // by-character typing and starts corrupting the line (confirmed
+        // empirically: "ip addr add" arrived as "ip addr aadd", "10.0.2.3" as
+        // "100.0.2.3", etc. -- random duplicated characters), silently
+        // mangling the whole automation script. dash (Debian's /bin/sh) has
+        // no readline at all, so switch to it before sending anything large.
+        // Alpine's ash was never affected by this (no readline either).
+        if (is_debian) {
+            pipe_send(hChildStdinW, "exec sh\n");
+            Sleep(2000); // generous: under host load, dash isn't always ready for stdin this fast
+        }
+
+        // Both real NFS servers we tried failed under this exact traffic
+        // pattern: the kernel's rpc.nfsd hangs the whole guest, and unfs3's
+        // unfsd segfaults on requests that arrive via QEMU hostfwd/NAT
+        // (confirmed empirically, works fine over plain loopback but not
+        // through the NAT path Windows actually uses). So: our own minimal
+        // NFSv3+MOUNT server (vdisknfsd.c, shipped alongside vdisk.exe),
+        // compiled with the guest's own gcc the first time it's needed and
+        // reused after (the binary lives on the persisted disk).
+        char selfdir[MAX_PATH] = {0}, srcpath[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, selfdir, sizeof(selfdir));
+        char *slash = strrchr(selfdir, '\\');
+        if (slash) *slash = '\0';
+        snprintf(srcpath, sizeof(srcpath), "%s\\vdisknfsd.c", selfdir);
+
+        FILE *sf = fopen(srcpath, "rb");
+        char *src = NULL;
+        long srclen = 0;
+        if (sf) {
+            fseek(sf, 0, SEEK_END);
+            srclen = ftell(sf);
+            fseek(sf, 0, SEEK_SET);
+            src = (char *)malloc((size_t)srclen + 1);
+            fread(src, 1, (size_t)srclen, sf);
+            src[srclen] = '\0';
+            fclose(sf);
+        }
+
+        const char *marker = "/tmp/vdisk_nfs_ready";
+        if (!src) {
+            printf("[vdisk] Warning: vdisknfsd.c not found next to vdisk.exe -- Explorer browsing unavailable.\n\n");
+        } else {
+            // Alpine uses apk (musl-dev for the C library headers); Debian's
+            // debootstrapped userland uses apt/dpkg (libc6-dev instead) and
+            // already has deb.debian.org in /etc/apt/sources.list from the
+            // debootstrap install itself, so no repo-file editing is needed
+            // here the way Alpine's local-repo-only base image needs.
+            char pkg_install[512];
+            if (is_debian) {
+                snprintf(pkg_install, sizeof(pkg_install),
+                    "apt-get update >/tmp/vdisk-nfs-install.log 2>&1; "
+                    "apt-get install -y gcc libc6-dev >>/tmp/vdisk-nfs-install.log 2>&1");
+            } else {
+                snprintf(pkg_install, sizeof(pkg_install),
+                    "grep -q v3.20/main /etc/apk/repositories 2>/dev/null || echo %s >> /etc/apk/repositories; "
+                    "grep -q v3.20/community /etc/apk/repositories 2>/dev/null || echo %s >> /etc/apk/repositories; "
+                    "apk update >/tmp/vdisk-nfs-install.log 2>&1; "
+                    "apk add --no-cache gcc musl-dev >>/tmp/vdisk-nfs-install.log 2>&1",
+                    ALPINE_REPO_MAIN, ALPINE_REPO_COMMUNITY);
+            }
+            size_t cap = (size_t)srclen + 4096;
+            char *provcmd = (char *)malloc(cap);
+            int n = snprintf(provcmd, cap,
+                // No modules/modloop on a real disk boot (unlike the diskless
+                // ISO boot), so udhcpc can't get a raw AF_PACKET socket to do
+                // DHCP (confirmed empirically: "socket(AF_PACKET,2,8): Address
+                // family not supported by protocol"). QEMU's user-mode SLIRP
+                // network has fixed, well-known addressing though, so just set
+                // it statically -- no raw socket needed for plain ip/route.
+                "which gcc >/dev/null 2>&1 || ( { ip link set eth0 up; "
+                "ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; "
+                "echo 'nameserver 10.0.2.3' > /etc/resolv.conf; "
+                "} >/tmp/vdisk-nfs-net.log 2>&1; %s )\n"
+                "cat > /root/vdisknfsd.c << 'VDISKEOF'\n%s\nVDISKEOF\n"
+                // The marker must only appear if the server is ACTUALLY
+                // listening on both ports -- confirmed the hard way: a plain
+                // sequence of newline-separated commands (no &&) writes the
+                // marker regardless of whether gcc/the build/the server
+                // start actually succeeded, so --nfs-worker would try to
+                // connect to a port nothing is listening on. SLIRP's hostfwd
+                // apparently completes the TCP handshake on the Windows side
+                // before finding that out, so that failure mode looks like
+                // an accepted connection that immediately EOFs -- not a
+                // clean refused connection -- which is what sent this in
+                // circles before the real cause (a silent build/start
+                // failure) was found.
+                "gcc -O2 -o /root/vdisknfsd /root/vdisknfsd.c -lpthread 2>/tmp/vdisk-nfsd-build.log && "
+                "pkill vdisknfsd 2>/dev/null; "
+                "( /root/vdisknfsd %u %u / >/tmp/vdisknfsd.log 2>&1 & ); "
+                "sleep 1; "
+                "[ \"$(grep -c 'listening on port' /tmp/vdisknfsd.log 2>/dev/null)\" = \"2\" ] && echo ok >%s\n",
+                pkg_install, src, nfs_port, mount_port, marker);
+            (void)n;
+            pipe_send(hChildStdinW, provcmd);
+            free(provcmd);
+        }
+        free(src);
+        Sleep(1000);
+
+        int prov_ok = 0;
+        DWORD deadline = GetTickCount() + (src ? 150000 : 1); // gcc install (if needed) + compile
+        while (src && GetTickCount() < deadline) {
+            if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+            char probe[128], hit[48];
+            snprintf(hit, sizeof(hit), "VDISK_NREADY_%lu", GetTickCount());
+            snprintf(probe, sizeof(probe), "test -f %s && echo %s\n", marker, hit);
+            pipe_send(hChildStdinW, probe);
+            if (wait_for_nth(&buf, hit, 2, 6000, pi.hProcess)) { prov_ok = 1; break; }
+            Sleep(3000);
+        }
+
+        if (prov_ok) {
+            // Empirically, the very first external (hostfwd/NAT) connection
+            // attempt right as the marker confirms can hang indefinitely
+            // waiting for a reply, even though the exact same server answers
+            // instantly once a few seconds have passed -- give the fresh
+            // hostfwd mapping a moment to settle before connecting.
+            Sleep(3000);
+            char exe[MAX_PATH];
+            GetModuleFileNameA(NULL, exe, sizeof(exe));
+            char wcmd[1024];
+            snprintf(wcmd, sizeof(wcmd), "\"%s\" --nfs-worker 127.0.0.1 %u %u / %c NTFS",
+                     exe, nfs_port, mount_port, browse_drive);
+
+            char dir[MAX_PATH], logpath[MAX_PATH];
+            HANDLE hLog = NULL;
+            if (get_data_dir(dir, sizeof(dir))) {
+                snprintf(logpath, sizeof(logpath), "%s\\nfsworker-%c.log", dir, browse_drive);
+                SECURITY_ATTRIBUTES lsa = { sizeof(lsa), NULL, TRUE };
+                hLog = CreateFileA(logpath, GENERIC_WRITE, FILE_SHARE_READ, &lsa,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            }
+
+            STARTUPINFOA wsi = { sizeof(wsi) };
+            if (hLog && hLog != INVALID_HANDLE_VALUE) {
+                wsi.dwFlags = STARTF_USESTDHANDLES;
+                wsi.hStdOutput = hLog;
+                wsi.hStdError = hLog;
+            }
+            PROCESS_INFORMATION wpi = {0};
+            if (CreateProcessA(NULL, wcmd, NULL, NULL, hLog ? TRUE : FALSE,
+                                CREATE_NO_WINDOW | DETACHED_PROCESS,
+                                NULL, NULL, &wsi, &wpi)) {
+                nfs_worker_pid = wpi.dwProcessId;
+                CloseHandle(wpi.hThread);
+                if (hLog && hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+                int mounted = 0;
+                for (int i = 0; i < 600; i++) {
+                    if (WaitForSingleObject(wpi.hProcess, 0) == WAIT_OBJECT_0) break;
+                    if (GetLogicalDrives() & (1u << (browse_drive - 'A'))) { mounted = 1; break; }
+                    Sleep(100);
+                }
+                if (mounted) {
+                    printf("[vdisk] %c:\\ now mirrors this VM's / live (read/write).\n\n", browse_drive);
+                } else {
+                    printf("[vdisk] Warning: %c:\\ browse mount didn't come up in time (see %s).\n\n",
+                           browse_drive, logpath);
+                    TerminateProcess(wpi.hProcess, 1);
+                    nfs_worker_pid = 0; // already torn down, nothing left to clean up later
+                }
+                CloseHandle(wpi.hProcess);
+            } else if (hLog && hLog != INVALID_HANDLE_VALUE) {
+                CloseHandle(hLog);
+            }
+        } else {
+            printf("[vdisk] Warning: NFS export did not confirm in time -- Explorer browsing unavailable\n");
+            printf("        this session (check /tmp/vdisk-nfs*.log inside the VM). Shell still works.\n\n");
+        }
+    } else {
+        printf("[vdisk] Did not reach the login prompt in time; skipping NFS/browse setup.\n\n");
+    }
+    fflush(stdout);
+
+    {
+        HANDLE hRealStdin = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD origMode = 0;
+        GetConsoleMode(hRealStdin, &origMode);
+        SetConsoleMode(hRealStdin, origMode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
+
+        in_relay_ctx_t ictx = { hRealStdin, hChildStdinW };
+        HANDLE hInThread = CreateThread(NULL, 0, in_relay_thread, &ictx, 0, NULL);
+
+        WaitForSingleObject(pi.hProcess, INFINITE);
+
+        SetConsoleMode(hRealStdin, origMode);
+        TerminateThread(hInThread, 0);
+    }
+
+    WaitForSingleObject(hOutThread, 2000);
+    CloseHandle(hChildStdoutR);
+    CloseHandle(hChildStdinW);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    outbuf_free(&buf);
+
+    // The guest server this worker talked to just went away with the VM --
+    // without this, the process (and its WinFsp-mounted drive letter) is
+    // never told to stop and lingers forever as a dead/phantom drive.
+    if (nfs_worker_pid) {
+        HANDLE hw = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, nfs_worker_pid);
+        if (hw) {
+            TerminateProcess(hw, 0);
+            WaitForSingleObject(hw, 3000);
+            CloseHandle(hw);
+        }
+    }
+
+    printf("\n[vdisk] Linux VM exited.\n");
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -739,41 +1071,24 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
             printf("[vdisk] --persist needs room for a data disk on %c: (see above).\n", L);
             return 0;
         }
-        unsigned long long persist_ram_mb = is_debian ? 1024 : 768;
+        // Debian's debootstrapped base (full glibc, apt/dpkg, more running
+        // processes) needs meaningfully more headroom than Alpine's BusyBox
+        // base, especially once gcc is compiling something on top of it --
+        // 1024 was observed to crash/reboot the guest under load (confirmed
+        // empirically running the NFS-browse setup automation).
+        unsigned long long persist_ram_mb = is_debian ? 2048 : 768;
         int installed = is_debian
             ? debian_install_if_needed(q, kernel, initrd, iso, img, persist_ram_mb)
             : persist_install_if_needed(q, kernel, initrd, iso, img, persist_ram_mb);
         if (!installed) return 0;
+        // Give the just-exited install-phase QEMU process a moment to fully
+        // release its lock on the disk image before the next QEMU process
+        // (run_persist_session) opens the same file -- WaitForSingleObject
+        // on its handle already confirmed process exit, but this is cheap
+        // insurance against any lingering OS-level I/O completion delay.
+        Sleep(1000);
 
-        char pcmd[2048];
-        snprintf(pcmd, sizeof(pcmd),
-                 "\"%s\" -accel whpx -accel tcg -M pc -m %llu -smp 2 -nographic "
-                 "-kernel \"%s\" -initrd \"%s\" "
-                 "-append \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw quiet\" "
-                 "-cdrom \"%s\" -drive file=\"%s\",format=raw,if=virtio",
-                 q, persist_ram_mb, kernel, initrd, iso, img);
-
-        printf("\n");
-        printf("=====================================================================\n");
-        printf(" vdisk linux -s %c --persist  --  persistent %s in QEMU (headless console)\n",
-               L, is_debian ? "Debian" : "Alpine");
-        printf(" Login: root  (no password).  Files/packages survive until 'vdisk remove %c:'.\n", L);
-        printf(" To leave: type 'poweroff' (recommended -- flushes writes to disk).\n");
-        printf(" NOTE: software emulation (TCG) -- boot takes ~1-2 min and runs slowly.\n");
-        printf("=====================================================================\n\n");
-        fflush(stdout);
-
-        STARTUPINFOA psi = { sizeof(psi) };
-        PROCESS_INFORMATION ppi = {0};
-        if (!CreateProcessA(NULL, pcmd, NULL, NULL, TRUE, 0, NULL, NULL, &psi, &ppi)) {
-            printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
-            return 0;
-        }
-        WaitForSingleObject(ppi.hProcess, INFINITE);
-        CloseHandle(ppi.hProcess);
-        CloseHandle(ppi.hThread);
-        printf("\n[vdisk] Linux VM exited.\n");
-        return 1;
+        return run_persist_session(q, kernel, initrd, iso, img, persist_ram_mb, L, is_debian);
     }
 
     // Give a tool install (or the bridge's cifs-utils) some headroom over the

@@ -19,6 +19,7 @@ so **no Administrator privileges are required** to mount or unmount them.
 - **Portable**: Locates WinFsp via the registry and stores its state in `%LOCALAPPDATA%\vdisk`; runs from any folder.
 - **Real Physical Disks**: `vdisk disk` attaches a RAM/VRAM-backed VHD via the native virtdisk API as a genuine `\\.\PhysicalDrive` — partitionable, testable, disposable — for safely exercising destructive disk tools.
 - **Real Linux VM**: `vdisk linux -s <DRIVE>` boots a real Alpine Linux kernel in QEMU, headless in your console, using the vdisk as storage (no admin, no reboot). Add `--persist` to install it onto the disk so it survives across runs, or `--distro debian` for a real Debian instead.
+- **Live Explorer Access**: every `--persist` session also mounts the VM's live `/` onto a free drive letter — real, read/write Explorer access while the VM runs, the same way `\\wsl$\` works for WSL2.
 - **Comprehensive CLI**: `create`, `disk`, `remove`, `clear`, `list`, `status`, `mount`, `autostart`, `linux`, and `help`.
 
 ---
@@ -263,6 +264,42 @@ vdisk linux -s D --distro debian --persist
   one-time install (~3–8 minutes, downloading Debian's package mirror);
   every run after that is offline and boots straight from the disk, same as
   Alpine's `--persist`.
+
+### Live Explorer access (like `\\wsl$\`)
+
+Every `--persist` session also tries to mount the VM's live `/` onto a free
+Windows drive letter automatically — no extra flag. While the VM is running
+you get real, read/write access from Explorer, `cmd`, PowerShell, or any
+other Windows app, the same way `\\wsl$\<distro>` works for WSL2:
+
+> Reliable on Alpine. On Debian it's best-effort — the automated setup can
+> fail to come up in time, in which case you'll see a warning and get a
+> plain interactive shell instead (nothing else is affected).
+
+```cmd
+vdisk linux -s D --persist
+:: ... boots, then prints something like:
+:: [vdisk] Z:\ now mirrors this VM's / live (read/write).
+```
+
+Open `Z:\` in Explorer while the VM keeps running in the console — create,
+edit, or delete files and they show up inside the guest immediately (and
+vice versa), since both sides are looking at the same real filesystem.
+
+**How it's safe**: the guest's own `ext4` kernel driver stays the *only*
+thing that ever touches the actual disk bytes. Windows never parses the
+filesystem itself — the mounted drive is a real NFSv3 network client (built
+from scratch for this, see `nfsclient.c`/`fs_nfsclient.c`) talking to a
+small NFSv3 server (`vdisknfsd.c`) that the guest compiles with its own
+`gcc`/`apt` build tools the first time it's needed (cached on the persisted
+disk after that, so subsequent sessions start it instantly). This is why
+it's safe to use at the same time as the VM's own interactive shell — there
+is never more than one thing writing to the disk image.
+
+If the automated setup can't finish in time (it needs outbound network the
+first time, to install `gcc`), you'll see a warning instead of a hard
+failure and the normal interactive shell still works exactly as before;
+check `/tmp/vdisk-nfs*.log` inside the VM for why.
 
 ---
 
