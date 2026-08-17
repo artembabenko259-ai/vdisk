@@ -1,0 +1,5 @@
+# Everything under linux/ (and any shell script) runs on real Linux --
+# force LF on checkout regardless of platform or local autocrlf settings,
+# so a CRLF-mangled shebang or bash script never breaks it.
+linux/** text eol=lf
+*.sh text eol=lf
