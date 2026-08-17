@@ -3,3 +3,13 @@
 *.exp
 vdisk_state.txt
 test_*
+
+# Linux kernel module build output (linux/)
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+linux/vdisk
