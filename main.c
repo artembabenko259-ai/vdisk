@@ -60,6 +60,36 @@ static BOOL is_user_admin(void) {
     return isAdmin;
 }
 
+// Appends argv-style quoting of s to out, following the same escaping rules
+// CommandLineToArgvW uses to split a command line back into argv (a
+// backslash only needs escaping when it immediately precedes a quote, and
+// N of them there become 2N, plus one more to escape the quote itself).
+// Wrapping s in a bare "..." without this used to let a drive letter/path
+// containing '"' close the quoted segment early, splicing extra argv
+// entries into the elevated re-invocation of vdisk.exe.
+static void append_quoted_arg(char *out, size_t outcap, const char *s) {
+    size_t o = strlen(out);
+    if (o + 1 < outcap) out[o++] = '"';
+    size_t backslashes = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\') {
+            backslashes++;
+        } else if (*p == '"') {
+            for (size_t i = 0; i < backslashes * 2 + 1 && o + 1 < outcap; i++) out[o++] = '\\';
+            if (o + 1 < outcap) out[o++] = '"';
+            backslashes = 0;
+        } else {
+            for (size_t i = 0; i < backslashes && o + 1 < outcap; i++) out[o++] = '\\';
+            backslashes = 0;
+            if (o + 1 < outcap) out[o++] = *p;
+        }
+    }
+    for (size_t i = 0; i < backslashes * 2 && o + 1 < outcap; i++) out[o++] = '\\';
+    if (o + 1 < outcap) out[o++] = '"';
+    if (o + 1 < outcap) out[o++] = ' ';
+    out[o < outcap ? o : outcap - 1] = '\0';
+}
+
 // Relaunches the current command elevated (for 'vdisk disk', which drives
 // diskpart). Returns 1 if the elevated process was started.
 static int relaunch_as_admin(int argc, char *argv[]) {
@@ -68,9 +98,7 @@ static int relaunch_as_admin(int argc, char *argv[]) {
 
     char args[2048] = "";
     for (int i = 1; i < argc; i++) {
-        strcat_s(args, sizeof(args), "\"");
-        strcat_s(args, sizeof(args), argv[i]);
-        strcat_s(args, sizeof(args), "\" ");
+        append_quoted_arg(args, sizeof(args), argv[i]);
     }
 
     SHELLEXECUTEINFOA sei = { sizeof(sei) };

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <stdint.h>
 #include "fs_memfs.h"
 #include "vram_allocator.h"
 
@@ -307,6 +308,12 @@ static int op_read(const char *path, char *buf, size_t size, fuse_off_t off,
 static int op_write(const char *path, const char *buf, size_t size, fuse_off_t off,
                     struct fuse_file_info *fi) {
     (void)fi;
+    // A negative or huge off would otherwise wrap `end` below back under
+    // n->size, skipping the grow/quota check entirely and making
+    // blob_write() copy straight past the end of the backing allocation.
+    if (off < 0 || (size_t)off > SIZE_MAX - size)
+        return -EINVAL;
+
     EnterCriticalSection(&g_lock);
     node_t *n = node_lookup(path);
     if (!n || n->is_dir) { LeaveCriticalSection(&g_lock); return -ENOENT; }

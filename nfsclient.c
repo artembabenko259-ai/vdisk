@@ -80,19 +80,22 @@ static unsigned long long rd_u64(xreader_t *r) {
 static unsigned int rd_bytes(xreader_t *r, unsigned char *out, unsigned int outcap) {
     unsigned int n = rd_u32(r);
     if (r->error) return 0;
-    unsigned int padded = (n + 3) & ~3u;
-    if (r->pos + padded > r->len) { r->error = 1; return 0; }
+    // 64-bit: n comes from the peer and near UINT_MAX wraps (n+3) back to
+    // ~0 in 32-bit arithmetic, defeating the bounds check and letting
+    // memcpy read up to outcap bytes past the real received buffer.
+    unsigned long long padded = ((unsigned long long)n + 3) & ~3ull;
+    if ((unsigned long long)r->pos + padded > (unsigned long long)r->len) { r->error = 1; return 0; }
     unsigned int copy = n < outcap ? n : outcap;
     memcpy(out, r->data + r->pos, copy);
-    r->pos += padded;
+    r->pos += (size_t)padded;
     return copy;
 }
 static void rd_skip_bytes(xreader_t *r) {
     unsigned int n = rd_u32(r);
     if (r->error) return;
-    unsigned int padded = (n + 3) & ~3u;
-    if (r->pos + padded > r->len) { r->error = 1; return; }
-    r->pos += padded;
+    unsigned long long padded = ((unsigned long long)n + 3) & ~3ull;
+    if ((unsigned long long)r->pos + padded > (unsigned long long)r->len) { r->error = 1; return; }
+    r->pos += (size_t)padded;
 }
 static void rd_fh(xreader_t *r, nfs_fh_t *fh) {
     fh->len = rd_bytes(r, fh->data, sizeof(fh->data));

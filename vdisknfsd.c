@@ -79,13 +79,21 @@ static const char *path_of(u64 id) {
     return g_paths[id];
 }
 
+// Returns NFS_ID_INVALID (never a real id, since 0 is the reserved root and
+// valid ids are otherwise < MAX_IDS) if the table is full -- callers must
+// check for this and fail the RPC instead of handing out a handle, since
+// silently returning 0 used to alias every over-capacity file to the export
+// root, redirecting later GETATTR/READ/WRITE/REMOVE calls onto "/" instead
+// of the file the caller actually meant.
+#define NFS_ID_INVALID ((u64)-1)
+
 static u64 id_of_path(const char *path) {
     pthread_mutex_lock(&g_lock);
     if (strcmp(path, g_root) == 0) { pthread_mutex_unlock(&g_lock); return 0; }
     for (int i = 1; i < g_id_count; i++) {
         if (g_paths[i] && strcmp(g_paths[i], path) == 0) { pthread_mutex_unlock(&g_lock); return (u64)i; }
     }
-    if (g_id_count >= MAX_IDS) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (g_id_count >= MAX_IDS) { pthread_mutex_unlock(&g_lock); return NFS_ID_INVALID; }
     int id = g_id_count++;
     g_paths[id] = strdup(path);
     pthread_mutex_unlock(&g_lock);
@@ -155,20 +163,24 @@ static u64 r_u64(xr_t *r) { u64 hi = r_u32(r), lo = r_u32(r); return (hi << 32) 
 static u32 r_bytes(xr_t *r, char *out, u32 outcap) {
     u32 n = r_u32(r);
     if (r->error) return 0;
-    u32 padded = (n + 3) & ~3u;
-    if (r->pos + padded > r->len) { r->error = 1; return 0; }
+    // 64-bit: n is attacker-controlled and near UINT32_MAX wraps (n+3) back
+    // to ~0 in 32-bit arithmetic, which used to make the bounds check below
+    // pass trivially and then memcpy up to outcap-1 bytes from wherever
+    // r->pos happened to be -- a heap over-read past the real buffer.
+    u64 padded = ((u64)n + 3) & ~3ull;
+    if ((u64)r->pos + padded > (u64)r->len) { r->error = 1; return 0; }
     u32 copy = n < outcap - 1 ? n : outcap - 1;
     memcpy(out, r->data + r->pos, copy);
     out[copy] = '\0';
-    r->pos += padded;
+    r->pos += (size_t)padded;
     return copy;
 }
 static void r_skip_auth(xr_t *r) {
     r_u32(r);
     u32 len = r_u32(r);
-    u32 padded = (len + 3) & ~3u;
-    if (r->pos + padded > r->len) { r->error = 1; return; }
-    r->pos += padded;
+    u64 padded = ((u64)len + 3) & ~3ull;
+    if ((u64)r->pos + padded > (u64)r->len) { r->error = 1; return; }
+    r->pos += (size_t)padded;
 }
 static u64 r_fh(xr_t *r) {
     unsigned char buf[64];
@@ -269,6 +281,7 @@ static void handle_nfs(u32 proc, xr_t *r, xw_t *w) {
         struct stat st;
         if (lstat(full, &st) != 0) { w_u32(w, errno_to_nfs(errno)); w_bool(w, 0); break; }
         u64 id = id_of_path(full);
+        if (id == NFS_ID_INVALID) { w_u32(w, E_NFS3ERR_NOSPC); w_bool(w, 0); break; }
         w_u32(w, NFS3_OK);
         w_fh(w, id);
         w_post_op_attr_ok(w, full);
@@ -315,7 +328,7 @@ static void handle_nfs(u32 proc, xr_t *r, xw_t *w) {
         (void)declared;
         if (r->pos + count > r->len) { r->error = 1; break; }
         const unsigned char *data = r->data + r->pos;
-        r->pos += (count + 3) & ~3u;
+        r->pos += (size_t)(((u64)count + 3) & ~3ull);
         const char *p = path_of(id);
         if (!p) { w_u32(w, E_NFS3ERR_NOENT); w_wcc_data_absent(w); break; }
         int fd = open(p, O_WRONLY);
@@ -346,6 +359,7 @@ static void handle_nfs(u32 proc, xr_t *r, xw_t *w) {
         if (fd < 0) { w_u32(w, errno_to_nfs(errno)); w_bool(w, 0); w_wcc_data_absent(w); break; }
         close(fd);
         u64 id = id_of_path(full);
+        if (id == NFS_ID_INVALID) { unlink(full); w_u32(w, E_NFS3ERR_NOSPC); w_bool(w, 0); w_wcc_data_absent(w); break; }
         w_u32(w, NFS3_OK);
         w_bool(w, 1); w_fh(w, id);
         w_post_op_attr_ok(w, full);
@@ -364,6 +378,7 @@ static void handle_nfs(u32 proc, xr_t *r, xw_t *w) {
         join_path(full, sizeof(full), dir, name);
         if (mkdir(full, mode & 0777) != 0) { w_u32(w, errno_to_nfs(errno)); w_bool(w, 0); w_wcc_data_absent(w); break; }
         u64 id = id_of_path(full);
+        if (id == NFS_ID_INVALID) { rmdir(full); w_u32(w, E_NFS3ERR_NOSPC); w_bool(w, 0); w_wcc_data_absent(w); break; }
         w_u32(w, NFS3_OK);
         w_bool(w, 1); w_fh(w, id);
         w_post_op_attr_ok(w, full);

@@ -113,9 +113,38 @@ int bridge_prompt_password(char *out, size_t out_sz) {
     return i > 0;
 }
 
+// Wraps s in single quotes for safe embedding as one word in a POSIX shell
+// command line, escaping any single quotes inside s via the standard
+// '\'' idiom (close quote, literal escaped quote, reopen quote). out must
+// be at least strlen(s)*4 + 3 bytes.
+static void shq(char *out, size_t outcap, const char *s) {
+    size_t o = 0;
+    if (outcap) out[0] = '\0';
+    if (o + 1 < outcap) out[o++] = '\'';
+    for (const char *p = s; *p && o + 5 < outcap; p++) {
+        if (*p == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
+        else out[o++] = *p;
+    }
+    if (o + 1 < outcap) out[o++] = '\'';
+    out[o < outcap ? o : outcap - 1] = '\0';
+}
+
 void bridge_append_mount_cmd(char *cmd, size_t cmd_sz, const char *share_name,
                               const char *username, const char *password) {
-    char extra[1300];
+    // username/password/share_name are attacker-adjacent (they can contain
+    // anything the Windows account name or a typed password contains, e.g.
+    // a literal "'"), so they must never be spliced verbatim into a shell
+    // command line -- that used to let a crafted password break out of the
+    // quoted printf argument and inject arbitrary commands into the guest.
+    // Each is shell-quoted into its own safe token first; the guest's own
+    // `printf` does the %s substitution (its format string is now a fixed
+    // literal), not our C-level snprintf.
+    char q_user[1100], q_pass[1100], q_share[1100];
+    shq(q_user, sizeof(q_user), username);
+    shq(q_pass, sizeof(q_pass), password);
+    shq(q_share, sizeof(q_share), share_name);
+
+    char extra[4096];
     // Credentials go in a short-lived file (not on the mount command line,
     // which would otherwise sit in `ps` output for as long as the process is
     // visible), and it's deleted immediately after use. The mount's own exit
@@ -123,10 +152,10 @@ void bridge_append_mount_cmd(char *cmd, size_t cmd_sz, const char *share_name,
     snprintf(extra, sizeof(extra),
              "apk add --no-cache cifs-utils >/tmp/vdisk-cifs-install.log 2>&1; "
              "mkdir -p /mnt/win; "
-             "printf 'username=%s\\npassword=%s\\n' > /tmp/.smbcred; chmod 600 /tmp/.smbcred; "
+             "{ printf 'username=%%s\\n' %s; printf 'password=%%s\\n' %s; } > /tmp/.smbcred; chmod 600 /tmp/.smbcred; "
              "mount -t cifs //10.0.2.2/%s /mnt/win -o credentials=/tmp/.smbcred,vers=3.0 >/tmp/vdisk-mount.log 2>&1; "
              "echo $? >/tmp/vdisk-mount.rc; "
              "rm -f /tmp/.smbcred; ",
-             username, password, share_name);
+             q_user, q_pass, q_share);
     strcat_s(cmd, cmd_sz, extra);
 }

@@ -2,6 +2,7 @@
 #include "qemu_linux.h"
 #include "vdisk_util.h"
 #include "bridge.h"
+#include "whpx_vmm.h"
 #include <windows.h>
 #include <urlmon.h>
 #include <stdio.h>
@@ -16,6 +17,55 @@
     "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso"
 #define ALPINE_REPO_MAIN      "https://dl-cdn.alpinelinux.org/alpine/v3.20/main"
 #define ALPINE_REPO_COMMUNITY "https://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+
+// Quotes a single word for safe embedding in a POSIX shell command line
+// that runs inside the guest (same '\'' escaping idiom as bridge.c's shq).
+// out must be at least strlen(s)*4 + 3 bytes.
+static void shq1(char *out, size_t outcap, const char *s) {
+    size_t o = 0;
+    if (outcap) out[0] = '\0';
+    if (o + 1 < outcap) out[o++] = '\'';
+    for (const char *p = s; *p && o + 5 < outcap; p++) {
+        if (*p == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
+        else out[o++] = *p;
+    }
+    if (o + 1 < outcap) out[o++] = '\'';
+    out[o < outcap ? o : outcap - 1] = '\0';
+}
+
+// tool_name / apk_packages come straight from --tools or the packages
+// favorites list, and used to be spliced verbatim into "apk add %s" /
+// "rc-service %s start" shell lines run inside the guest -- a name
+// containing ';', '`', '$(...)' etc. would inject arbitrary commands.
+// apk_packages can legitimately be several space-separated package names,
+// so each word is quoted individually rather than the whole string at once
+// (which would collapse them into one argument).
+static void shq_words(char *out, size_t outcap, const char *s) {
+    size_t o = 0;
+    if (outcap) out[0] = '\0';
+    const char *p = s;
+    int first = 1;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        char word[256];
+        size_t wl = (size_t)(p - start);
+        if (wl >= sizeof(word)) wl = sizeof(word) - 1;
+        memcpy(word, start, wl);
+        word[wl] = '\0';
+
+        char qword[1100];
+        shq1(qword, sizeof(qword), word);
+
+        size_t qlen = strlen(qword);
+        if (!first && o + 1 < outcap) out[o++] = ' ';
+        if (o + qlen < outcap) { memcpy(out + o, qword, qlen); o += qlen; }
+        out[o < outcap ? o : outcap - 1] = '\0';
+        first = 0;
+    }
+}
 
 #define DEBIAN_APT_REPO "http://deb.debian.org/debian"
 
@@ -623,6 +673,21 @@ static int run_persist_session(const char *qemu_bin, const char *kernel, const c
     // as "phantom disks remain, still laggy" after quitting a VM session).
     DWORD nfs_worker_pid = 0;
     char browse_drive = 0;
+
+    // Belt-and-suspenders against orphaned QEMU/nfs-worker processes (and the
+    // phantom drive letters they leave behind): the explicit cleanup below
+    // only runs if this function returns normally. If vdisk.exe itself dies
+    // abnormally (Ctrl+C, Task Manager, closed console) that cleanup code
+    // never executes. A job object fixes this at the OS level instead: when
+    // the LAST handle to the job closes -- including implicitly, when this
+    // process exits for ANY reason -- Windows kills every process still
+    // assigned to it. No code path to forget to hit.
+    HANDLE hJob = CreateJobObjectA(NULL, NULL);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    }
     for (char c = 'Z'; c >= 'D'; c--) {
         if (c == L) continue;
         if (!(GetLogicalDrives() & (1u << (c - 'A')))) { browse_drive = c; break; }
@@ -667,11 +732,14 @@ static int run_persist_session(const char *qemu_bin, const char *kernel, const c
         PROCESS_INFORMATION ppi = {0};
         if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &psi, &ppi)) {
             printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
+            if (hJob) CloseHandle(hJob);
             return 0;
         }
+        if (hJob) AssignProcessToJobObject(hJob, ppi.hProcess);
         WaitForSingleObject(ppi.hProcess, INFINITE);
         CloseHandle(ppi.hProcess);
         CloseHandle(ppi.hThread);
+        if (hJob) CloseHandle(hJob);
         printf("\n[vdisk] Linux VM exited.\n");
         return 1;
     }
@@ -681,6 +749,7 @@ static int run_persist_session(const char *qemu_bin, const char *kernel, const c
     if (!CreatePipe(&hChildStdinR, &hChildStdinW, &sa, 0) ||
         !CreatePipe(&hChildStdoutR, &hChildStdoutW, &sa, 0)) {
         printf("[vdisk] Failed to create pipes (error %lu).\n", GetLastError());
+        if (hJob) CloseHandle(hJob);
         return 0;
     }
     SetHandleInformation(hChildStdinW, HANDLE_FLAG_INHERIT, 0);
@@ -696,8 +765,10 @@ static int run_persist_session(const char *qemu_bin, const char *kernel, const c
         printf("[vdisk] Failed to launch QEMU (error %lu).\n", GetLastError());
         CloseHandle(hChildStdinR); CloseHandle(hChildStdinW);
         CloseHandle(hChildStdoutR); CloseHandle(hChildStdoutW);
+        if (hJob) CloseHandle(hJob);
         return 0;
     }
+    if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
     CloseHandle(hChildStdinR);
     CloseHandle(hChildStdoutW);
 
@@ -857,6 +928,7 @@ static int run_persist_session(const char *qemu_bin, const char *kernel, const c
                                 CREATE_NO_WINDOW | DETACHED_PROCESS,
                                 NULL, NULL, &wsi, &wpi)) {
                 nfs_worker_pid = wpi.dwProcessId;
+                if (hJob) AssignProcessToJobObject(hJob, wpi.hProcess);
                 CloseHandle(wpi.hThread);
                 if (hLog && hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
                 int mounted = 0;
@@ -919,9 +991,116 @@ static int run_persist_session(const char *qemu_bin, const char *kernel, const c
             CloseHandle(hw);
         }
     }
+    if (hJob) CloseHandle(hJob);
 
     printf("\n[vdisk] Linux VM exited.\n");
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Same job as run_persist_session() above, but drives the built-in
+// Windows-Hypervisor-Platform VMM (whpx_vmm.c) instead of a QEMU child
+// process. Reuses outbuf_t/pipe_send/wait_for_nth/in_relay_thread/
+// out_relay_thread completely unmodified -- the VMM's serial console is
+// bridged to the exact same pipe shape a QEMU child's stdin/stdout would
+// have been, so the login automation code below doesn't know the
+// difference. No networking in v1 (no virtio-net), so there's no NFS/
+// browse-drive automation here -- just login + hand off to an interactive
+// shell, same as the plain (!browse_drive) path above.
+typedef struct {
+    char kernel[MAX_PATH], initrd[MAX_PATH], img[MAX_PATH], cmdline[512];
+    unsigned long long ram_mb;
+    HANDLE hIn, hOut;
+    int result;
+} whpx_thread_args_t;
+
+static DWORD WINAPI whpx_thread_proc(LPVOID param) {
+    whpx_thread_args_t *a = (whpx_thread_args_t *)param;
+    a->result = whpx_vmm_run(a->kernel, a->initrd, a->img, a->cmdline, a->ram_mb, a->hIn, a->hOut);
+    return 0;
+}
+
+static int run_persist_session_whpx(const char *kernel, const char *initrd, const char *img,
+                                     unsigned long long vm_ram_mb, char L) {
+    printf("\n");
+    printf("=====================================================================\n");
+    printf(" vdisk linux -s %c --persist  --  persistent Alpine (built-in VMM, no QEMU)\n", L);
+    printf(" Login: root  (no password).  Files/packages survive until 'vdisk remove %c:'.\n", L);
+    printf(" NOTE: no networking in this mode yet -- Explorer live-mount (Z:\\) isn't available.\n");
+    printf(" To leave: type 'poweroff' (recommended -- flushes writes to disk).\n");
+    printf("=====================================================================\n\n");
+    fflush(stdout);
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hChildStdinR, hChildStdinW, hChildStdoutR, hChildStdoutW;
+    if (!CreatePipe(&hChildStdinR, &hChildStdinW, &sa, 0) ||
+        !CreatePipe(&hChildStdoutR, &hChildStdoutW, &sa, 0)) {
+        printf("[vdisk] Failed to create pipes (error %lu).\n", GetLastError());
+        return 0;
+    }
+    SetHandleInformation(hChildStdinW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hChildStdoutR, HANDLE_FLAG_INHERIT, 0);
+
+    whpx_thread_args_t args;
+    memset(&args, 0, sizeof(args));
+    strcpy_s(args.kernel, sizeof(args.kernel), kernel);
+    strcpy_s(args.initrd, sizeof(args.initrd), initrd);
+    strcpy_s(args.img, sizeof(args.img), img);
+    // virtio_mmio.device=<size>@<addr>:<irq> must match whpx_vmm.c's
+    // VIRTIO_MMIO_BASE/SIZE/IRQ constants exactly.
+    snprintf(args.cmdline, sizeof(args.cmdline),
+             "console=ttyS0 root=/dev/vda rootfstype=ext4 rw quiet virtio_mmio.device=512@0xd0000000:5");
+    args.ram_mb = vm_ram_mb;
+    args.hIn = hChildStdinR;
+    args.hOut = hChildStdoutW;
+    args.result = 0;
+
+    HANDLE hVmmThread = CreateThread(NULL, 0, whpx_thread_proc, &args, 0, NULL);
+    if (!hVmmThread) {
+        printf("[vdisk] Failed to start the built-in VMM thread.\n");
+        CloseHandle(hChildStdinR); CloseHandle(hChildStdinW);
+        CloseHandle(hChildStdoutR); CloseHandle(hChildStdoutW);
+        return 0;
+    }
+
+    outbuf_t buf;
+    outbuf_init(&buf);
+    out_relay_ctx_t octx = { hChildStdoutR, GetStdHandle(STD_OUTPUT_HANDLE), &buf };
+    HANDLE hOutThread = CreateThread(NULL, 0, out_relay_thread, &octx, 0, NULL);
+
+    if (wait_for_nth(&buf, "login:", 1, 180000, hVmmThread)) {
+        pipe_send(hChildStdinW, "root\n");
+        Sleep(2000);
+    } else {
+        printf("[vdisk] Did not reach the login prompt in time.\n\n");
+    }
+    fflush(stdout);
+
+    {
+        HANDLE hRealStdin = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD origMode = 0;
+        GetConsoleMode(hRealStdin, &origMode);
+        SetConsoleMode(hRealStdin, origMode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
+
+        in_relay_ctx_t ictx = { hRealStdin, hChildStdinW };
+        HANDLE hInThread = CreateThread(NULL, 0, in_relay_thread, &ictx, 0, NULL);
+
+        WaitForSingleObject(hVmmThread, INFINITE);
+
+        SetConsoleMode(hRealStdin, origMode);
+        TerminateThread(hInThread, 0);
+    }
+
+    WaitForSingleObject(hOutThread, 2000);
+    CloseHandle(hChildStdoutR);
+    CloseHandle(hChildStdinW);
+    CloseHandle(hChildStdinR);
+    CloseHandle(hChildStdoutW);
+    outbuf_free(&buf);
+
+    int result = args.result;
+    CloseHandle(hVmmThread);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1267,14 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
         // insurance against any lingering OS-level I/O completion delay.
         Sleep(1000);
 
+        // The built-in VMM only knows the plain "boot straight from the
+        // persisted disk" flow (no networking yet), which is exactly what
+        // Alpine's persist path is -- Debian stays on QEMU for now (v1
+        // scope), and so does everyone until 'vdisk accel enable' has
+        // actually been run, since unlike QEMU we have no TCG fallback.
+        if (!is_debian && whpx_vmm_available()) {
+            return run_persist_session_whpx(kernel, initrd, img, persist_ram_mb, L);
+        }
         return run_persist_session(q, kernel, initrd, iso, img, persist_ram_mb, L, is_debian);
     }
 
@@ -1248,15 +1435,17 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
         // 'tool_name' IS the apk package, and we make a best-effort attempt to
         // start it as an OpenRC service afterwards ("|| true": harmless no-op
         // for plain CLI tools that have no service to start).
-        char generic_script[192] = "";
+        char generic_script[512] = "";
         const char *apk_packages = recipe ? recipe->apk_packages : tool_name;
         const char *provision_script = "";
         if (tool_name) {
             if (recipe) {
                 provision_script = recipe->provision_script;
             } else {
+                char q_tool[1100];
+                shq1(q_tool, sizeof(q_tool), tool_name);
                 snprintf(generic_script, sizeof(generic_script),
-                         "rc-service %s start >/tmp/vdisk-service-start.log 2>&1 || true; ", tool_name);
+                         "rc-service %s start >/tmp/vdisk-service-start.log 2>&1 || true; ", q_tool);
                 provision_script = generic_script;
             }
         }
@@ -1277,10 +1466,12 @@ int qemu_run_linux(char L, const char *tool_name, int tools_net, int want_share,
             strcat_s(provcmd, sizeof(provcmd), repopart);
         }
         if (tool_name) {
-            char installpart[700];
+            char q_packages[2048];
+            shq_words(q_packages, sizeof(q_packages), apk_packages);
+            char installpart[2560];
             snprintf(installpart, sizeof(installpart),
                      "apk add --no-cache %s >/tmp/vdisk-apk-install.log 2>&1; echo $? >%s; %s",
-                     apk_packages, rcfile, provision_script);
+                     q_packages, rcfile, provision_script);
             strcat_s(provcmd, sizeof(provcmd), installpart);
         }
         if (want_share) {
